@@ -1,0 +1,64 @@
+{
+  "main-commands": {
+    "--connect": {
+      "prefix": "-c",
+      "action": "store_true",
+      "help": "If set to true, the client will attempt to connect to the specified VPN server."
+    },
+    "--server": {
+      "prefix": "-s",
+      "action": "store_true",
+      "help": "If set to true, the VPN server will start and be ready to accept client connections."
+    },
+    "--host": {
+      "required": true,
+      "help": "This command is used for both the server and the client to define the IP address of the VPN server to connect to or mount."
+    },
+    "--port": {
+      "required": true,
+      "help": "This command is used for both the server and the client to define the port for connecting or mounting the VPN server"
+    },
+    "--interface": {
+      "prefix": "-i",
+      "help": "This command allows you to define the name of the network interface that will be used for the VPN connection."
+    },
+    "--api-port": {
+      "prefix": "-api",
+      "help": "This command allows you to define the port on which the VPN server’s API will run."
+    }
+  },
+  "server-commands": {
+    "--add-user": {
+      "prefix": "-au",
+      "action": "store_true"
+    },
+    "--add-network": {
+      "prefix": "-an",
+      "action": "store_true"
+    },
+    "--list-users": {
+      "prefix": "-ln",
+      "action": "store_true"
+    },
+    "--list-networks": {
+      "prefix": "-lu",
+      "action": "store_true"
+    },
+    "--username": {
+      "prefix": "-u",
+      "action": "store"
+    },
+    "--password": {
+      "prefix": "-p"
+    },
+    "--network-id": {
+      "prefix": "-ni"
+    },
+    "--ip-address": {
+      "prefix": "-ip"
+    },
+    "--network-range": {
+      "prefix": "-nr"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["scapy==2.5.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "virtual_network"
+version = "0.0.1"
+description = "Simple virtual network"
+readme = "readme.md"
+authors = [{ name = "Angelo", email = "angelohh29.04@gmail.com" }]
+
+[project.scripts]
+hello_cli = "__main__:main"
