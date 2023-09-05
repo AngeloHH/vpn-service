@@ -4,17 +4,18 @@ import struct
 from typing import Optional
 
 import pytun
+from bson import ObjectId
+from pymongo import MongoClient
 from scapy.layers.inet import IP
 
 from connection import DefaultAuth
-from connection.network import NetworkManager
+from connection.network import Manager
 
 
 class VPNServer:
-    def __init__(self, ip_address: str = '0.0.0.0'):
-        self.network_manager = NetworkManager(DefaultAuth())
-        self._is_stopped = False
-        self.ip_address = ip_address
+    def __init__(self, mongo_client: MongoClient, table_name: str):
+        self._is_stopped, self.ip_address = False, '0.0.0.0'
+        self.network_manager = Manager(mongo_client, table_name)
 
     def stop_server(self): self._is_stopped = True
 
@@ -22,42 +23,19 @@ class VPNServer:
         # Convert the connection tuple into a unique key.
         key_addr = ':'.join(map(str, connection[1]))
         packet = IP(connection[0])
-        connections = self.network_manager.connections
-        connections = connections.get(key_addr, None)
-        network = self.network_manager.network[connections]
+        connection = self.network_manager.get_connection({'connection': key_addr})
+        network = self.network_manager.filter_network(connection['network_id'])
         # Get a list of connections from the network information.
-        connections = network.get('connections', {}).keys()
-        # Check if the destination address is not in the list
-        # of connections.
-        if packet.dst not in connections:
+        connections = network['connections'].items()
+        # Check if the destination address is not in the list of connections.
+        user_id = next((key for key, value in connections if value == packet.dst), None)
+        if user_id is None:
             port = packet.dport if hasattr(packet, 'dport') else 0
             return (packet.dst, port), True
-        return network['connections'][packet.dst], False
-
-    def new_connection(self, connection: tuple[bytes, any]) -> bytes:
-        # Get the authentication method being used.
-        auth_method = self.network_manager.auth_method
-        # Extract the username and key address from the connection.
-        username = auth_method.unpack_credentials(connection[0])[0]
-        key_addr = ':'.join(map(str, connection[1]))
-        # Check if there's an existing connection with the same key
-        # address.
-        connections = self.network_manager.connections
-        network, packet = connections.get(key_addr, None), b''
-        if network is not None: return connection[0]
-
-        # Authenticate the new connection and get the status, received packet,
-        # and account.
-        status, recv_packet, _ = self.network_manager.authenticate(connection)
-        # Iterate through the accounts to find a matching username.
-        for index, account in enumerate(self.network_manager.accounts):
-            if not status or account[0] != username: continue
-            args = account, connection
-            packet = recv_packet + self.network_manager.add_to_network(*args)
-            # Store the connection in the connections' dictionary.
-            self.network_manager.connections[key_addr] = account[2]
-            break
-        return packet
+        consult = {'account_id': ObjectId(user_id)}
+        destination = self.network_manager.get_connection(consult)
+        destination = destination['connection'].split(':')
+        return (destination[0], int(destination[1])), False
 
     def run_server(self, port: int = 5732, tunnel: bool = False):
         server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -66,12 +44,13 @@ class VPNServer:
             # Check if the server should be stopped.
             if self._is_stopped: break
             connection = server.recvfrom(65535)
+            print(connection)
             key_address = ':'.join(map(str, connection[1]))
-            connections = self.network_manager.connections
             # If the key address is not in the connections,
             # establish a new connection
-            if key_address not in connections:
-                recv_packet = self.new_connection(connection)
+            consult = self.network_manager.get_connection
+            if consult({'connection': key_address}) is None:
+                recv_packet = self.network_manager.new_connection(connection)
                 server.sendto(recv_packet, connection[1])
                 continue
             # Determine the destination IP address and whether it's
@@ -108,7 +87,7 @@ class VPNClient:
         if recv_packet == b'\x03' or len(recv_packet) == 0:
             raise Exception('Connection failed: incorrect credentials')
         # Unpack the received packet to extract decoded data.
-        packet = struct.unpack(f'4s4s{self.token_length}s', recv_packet[1:])
+        packet = struct.unpack(f'4s4s{self.token_length}s', recv_packet)
         return decode(packet[0]), decode(packet[1]), packet[2]
 
     def connect(self, credentials: tuple, interface: str):
@@ -124,8 +103,8 @@ class VPNClient:
         while True:
             # Monitor I/O sources for the TUN device and the socket server.
             for source in select.select([tun, self.socket_server], [], [])[0]:
-                # If the source is the TUN device, read data and send it to the
-                # server.
+                # If the source is the TUN device, read data and send it to
+                # the server.
                 if type(source) == pytun.TunTapDevice:
                     arguments = source.read(tun.mtu), self.server_address
                     self.transferred[1] = self.socket_server.sendto(*arguments)
