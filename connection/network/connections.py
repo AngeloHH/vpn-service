@@ -3,6 +3,7 @@ import struct
 
 import bcrypt
 from bson import ObjectId
+from cryptography.fernet import Fernet
 from pymongo import MongoClient
 
 from connection import DefaultAuth
@@ -25,7 +26,7 @@ class ConnectionManager:
     def __init__(self, client: MongoClient, db_name: str):
         self.collection = client[db_name]['connections']
         self.__client = client[db_name]
-        self.token_length, self.auth_method = 10, DefaultAuth()
+        self.token_length, self.auth_method = 44, DefaultAuth()
 
     def filter_object(self, table: str, query: dict, first=True):
         consult = 'find_one' if first else 'find'
@@ -53,7 +54,7 @@ class ConnectionManager:
             connection=':'.join(map(str, connection[1])),
             account_id=account['_id'],
             network_id=network['_id'],
-            encrypt=secrets.token_hex(10)
+            encrypt=Fernet.generate_key().decode('utf-8')
         )
         self.del_connection(account['_id'])
         self.collection.insert_one(new_connection)

@@ -17,11 +17,11 @@ The client establishes a connection with the server, sending user credentials as
 
 ## Future Changes
 This project is continually evolving, and future changes and improvements are planned:
-- [ ] **Encryption**: Implement encryption using the provided encryption key from the server.
-- [ ] **Data Structuring**: Improve the data structuring within the application.
-- [ ] **Usage Statistics**: Display the amount of data transferred for each user account.
-- [ ] **Enhanced Authentication**: Strengthen authentication methods, possibly moving away from plaintext passwords.
+- [x] **Encryption**: Implemented encryption using the provided encryption key from the server.
+- [x] **Data Structuring**: Improved the data structuring within the application, utilizing a MongoDB database to store information.
+- [x] **Usage Statistics**: Display the amount of data transferred for each user account.
+- [x] **Enhanced Authentication**: Strengthened authentication methods, moving away from plaintext passwords.
 - [ ] **Absolute Redirection**: Allow for the complete redirection of user connections, essentially functioning as a VPN.
-- [ ] **Multithreading**: Utilize more threads to increase data processing speed when handling user data.
+- [x] **Multithreading**: Utilized more threads to increase data processing speed when handling user data.
 
 Feel free to contribute, offer suggestions, or provide feedback to help enhance this VPN project!

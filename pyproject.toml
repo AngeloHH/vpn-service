@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scapy==2.5.0", "pymongo==4.5.0", "bcrypt==4.0.1"]
+requires = ["scapy==2.5.0", "pymongo==4.5.0", "bcrypt==4.0.1", "cryptography==41.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
