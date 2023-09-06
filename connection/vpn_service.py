@@ -33,9 +33,8 @@ class VPNServer:
             port = packet.dport if hasattr(packet, 'dport') else 0
             return (packet.dst, port), True
         consult = {'account_id': ObjectId(user_id)}
-        destination = self.network_manager.get_connection(consult)
-        destination = destination['connection'].split(':')
-        return (destination[0], int(destination[1])), False
+        destination = self.network_manager.get_connection(consult)['connection']
+        return (destination.split(':')[0], int(destination.split(':')[1])), False
 
     def run_server(self, port: int = 5732, tunnel: bool = False):
         server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -58,7 +57,10 @@ class VPNServer:
             # tunneling is enabled, send the packet.
             ip_address, is_external = self.get_destination(connection)
             if not is_external or tunnel:
-                length = server.sendto(connection[0], ip_address)
+                server.sendto(connection[0], ip_address)
+                self.network_manager.transfer(connection)
+                connection = (connection[0], ip_address)
+                self.network_manager.transfer(connection, True)
 
 
 class VPNClient:
@@ -108,11 +110,9 @@ class VPNClient:
                 if type(source) == pytun.TunTapDevice:
                     arguments = source.read(tun.mtu), self.server_address
                     self.transferred[1] = self.socket_server.sendto(*arguments)
-                    print(arguments[0])
                     continue
                 # If the source is the socket server, receive data and write it
                 # to the TUN device.
                 packet_data, _ = source.recvfrom(65535)
                 if len(packet_data) > 0:
-                    print(packet_data)
                     self.transferred[0] = tun.write(packet_data)
