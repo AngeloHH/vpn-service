@@ -1,7 +1,6 @@
 import select
 import socket
 import struct
-import time
 from threading import Thread
 from typing import Optional
 

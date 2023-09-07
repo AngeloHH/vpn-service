@@ -42,9 +42,7 @@ def launch_client(host: str, port: int, interface: str):
     except Exception as error: print(error)
 
 
-def server_commands(command: str, net_manager: Manager):
-    commands = file['server-commands']
-    args = arguments_manager('', commands, command.split())
+def server_commands(args, net_manager: Manager):
     user = hasattr(args, 'username') and hasattr(args, 'password')
     if args.add_user and user and hasattr(args, 'network_id'):
         user_id = net_manager.new_account(args.username, args.password)
@@ -66,28 +64,25 @@ def server_commands(command: str, net_manager: Manager):
                 print(connection[0], '=>', connection[1])
 
 
-def write_command(net_manager: Manager):
-    while True:
-        command = input('Command: /server ')
-        server_commands(command, net_manager)
-
-
-def launch_server(host: str, port: int):
+def launch_server(commands: dict, host: str, port: int):
     mongo_client = MongoClient("mongodb://localhost:27017/")
     vpn = VPNServer(mongo_client, 'test_network')
-    vpn.ip_address = host
-    manager = vpn.network_manager
-    kwargs = dict(target=write_command, args=(manager, ))
-    threading.Thread(**kwargs, daemon=True).start()
-    vpn.run_server(port=port)
+    vpn.ip_address, manager = host, vpn.network_manager
+    server = threading.Thread(target=vpn.run_server, args=(port, ), daemon=True)
+    server.start()
+    while True:
+        command = input('Command: /server ').split()
+        details = ''
+        server_commands(arguments_manager(details, commands, command), manager)
 
 
-if __name__ == '__main__':
-    file = json.loads(open('commands.json').read())
+def main(command_file):
+    file = json.loads(open(command_file).read())
     title = '[Python] Simple VPN'
 
     args = arguments_manager(title, file['main-commands'])
     if args.connect and args.interface:
         launch_client(args.host, int(args.port), args.interface)
     if args.server:
-        launch_server(args.host, int(args.port))
+        commands = file['server-commands']
+        launch_server(commands, args.host, int(args.port))

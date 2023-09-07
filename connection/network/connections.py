@@ -1,4 +1,3 @@
-import secrets
 import struct
 
 import bcrypt
