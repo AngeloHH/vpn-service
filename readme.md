@@ -1,27 +1,45 @@
-# VPN Project
+# Simple VPN
 
-## Table of Contents
-- [Introduction](#introduction)
-- [How It Works](#how-it-works)
-- [Future Changes](#future-changes)
+This project consists of a client and server VPN that allows you to create virtual networks without the need to create new network interfaces on the server. It was primarily developed to enhance my skills in socket programming, thread management, and selectors. To create virtual network interfaces on the client side, the pytun library is used, and user and network information is stored in a MongoDB database.
 
-## Introduction
-The VPN project is a simple client-server application designed to establish virtual networks independently of each other. It uses sockets, pytun, threads, and select to manage connections efficiently. Additionally, it comes with a CLI (Command Line Interface) to provide a user-friendly way to interact with the VPN.
+<p style="text-align: center">
+<img src="./network_picture.png" alt="network-picture">
+</p>
 
-## How It Works
-### Server
-When a client connects to the server, the first packet it sends should contain the user's credentials. The server responds with information for the virtual interface and a hash key for packet encryption. Each client request is associated with a virtual network, and the server routes packets to the intended recipient's connection. Notably, the server does not require a virtual network interface.
+## Server Features
+- Credential Security: User passwords are not stored in plain text, ensuring enhanced security.
+- Transfer Statistics: Real-time statistics on the data transfer rate for each user account.
+- Multi-Threading: Each connection is managed in a separate thread, enabling efficient handling of multiple connections.
+- Independent Virtual Networks: Each created network is independent, increasing user privacy.
+- End-to-End Encryption: The connection is end-to-end encrypted, meaning only the server and client have access to the token for decrypting packets.
 
-### Client
-The client establishes a connection with the server, sending user credentials as its initial packet. Once connected, the client receives information about the virtual interface and an encryption key. Any subsequent data sent by the client is routed through the virtual network.
+## Future Features
+- Full Routing: Implementing the ability to access any address from the VPN client when the server has this feature enabled.
+- Add a transfer rate limit: Implementing a maximum data transfer speed for VPN connections.
 
-## Future Changes
-This project is continually evolving, and future changes and improvements are planned:
-- [x] **Encryption**: Implemented encryption using the provided encryption key from the server.
-- [x] **Data Structuring**: Improved the data structuring within the application, utilizing a MongoDB database to store information.
-- [x] **Usage Statistics**: Display the amount of data transferred for each user account.
-- [x] **Enhanced Authentication**: Strengthened authentication methods, moving away from plaintext passwords.
-- [ ] **Absolute Redirection**: Allow for the complete redirection of user connections, essentially functioning as a VPN.
-- [x] **Multithreading**: Utilized more threads to increase data processing speed when handling user data.
+## How to Create a Server
+You can create a VPN server as follows:
 
-Feel free to contribute, offer suggestions, or provide feedback to help enhance this VPN project!
+```python
+from pymongo import MongoClient
+from connection import VPNServer
+
+client = MongoClient("mongodb://localhost:27017/")
+vpn_server = VPNServer(client, 'test_network')
+# Optionally, you can specify an IP address.
+vpn_server.ip_address = '127.0.0.1'
+vpn_server.run_server(port=5732)
+```
+
+## How to Connect to the Server
+To connect to the VPN server, you can follow these steps:
+
+```python
+from connection import VPNClient
+
+# Specify the server's address and port.
+vpn_client = VPNClient(('127.0.0.1', 5732))
+# Replace with the appropriate credentials.
+credentials = 'Username', 'password123*'
+vpn_client.connect(credentials, 'my_interface')
+```
