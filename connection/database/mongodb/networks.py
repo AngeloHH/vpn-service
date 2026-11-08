@@ -1,5 +1,3 @@
-import os
-
 from bson import ObjectId
 from pymongo.collection import Collection
 
@@ -20,10 +18,7 @@ class Network(Account):
     def _get_address(self):
         network, address = self.get(), None
         base_address = network['network_range'].split('/')[0]
-        # Iterate through available IP addresses in the network.
         for address_id in range(network['max_address']):
-            # If the IP address is not in use, assign it to
-            # the account.
             address = new_address(base_address, address_id)
             if address not in network['connections'].values():
                 break
@@ -31,13 +26,12 @@ class Network(Account):
 
     def to_network(self, account: Account):
         network, account_details = self.get(), account.get()
-        # If not, add the network ID to the account's networks
-        # with an initial empty IP address.
+        # Account and network documents keep mirrored membership indexes.
         if network['_id'] not in account_details['networks']:
             networks = account_details['networks']
             networks[self.id.__str__()] = dict(ip_address=None)
             account.update(networks=networks)
-        # Try to get the IP address from network's connections.
+        # Reuse the assigned address or select the first available one.
         arguments = account.id, self._get_address()
         ip_address = network['connections'].get(*arguments)
         address_list = network['connections'].items()
@@ -46,7 +40,6 @@ class Network(Account):
             network['connections'][account.id.__str__()] = ip_address
             if ip_address in address_list:
                 raise AddressConflict(ip_address).already_defined()
-            # Update the network with the new connections.
             self.update(connections=network['connections'])
         return ip_address
 
@@ -54,12 +47,11 @@ class Network(Account):
 class Connection(Account):
     def __init__(self, collection: Collection, _id: str or ObjectId = None):
         super().__init__(collection, _id)
-        self.close, self.length = lambda **kwargs: self.delete(**kwargs), 40
+        self.close = lambda **kwargs: self.delete(**kwargs)
 
     def create(self, network: Network, account: Account, ip_address: str, socket: tuple):
         return super().create(
             account_id=account.id,
-            encrypt=os.urandom(int(self.length / 2)).hex(),
             network_id=network.id,
             ip_address=ip_address,
             connection=':'.join(map(str, socket))

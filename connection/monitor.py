@@ -12,10 +12,7 @@ class SpeedMonitor:
         while True:
             download, upload = self.transferred
             time.sleep(1)
-            # Acquire the lock to ensure thread safety when updating speed.
             with self.lock:
-                # Calculate the download and upload speed in bytes per second
-                # by subtracting the previous counters from the current ones.
                 self.speed[0] = self.transferred[0] - download
                 self.speed[1] = self.transferred[1] - upload
 

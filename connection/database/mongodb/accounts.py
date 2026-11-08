@@ -25,3 +25,6 @@ class Account:
     def update(self, **kwargs):
         self.collection.update_one({"_id": self.id}, {"$set": kwargs})
         return self.get()
+
+    def increment(self, **kwargs):
+        return self.collection.update_one({"_id": self.id}, {"$inc": kwargs})
