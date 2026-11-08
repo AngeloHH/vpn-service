@@ -1,7 +1,3 @@
-import platform
-import subprocess
-
-
 def new_address(default_address: str, address_id: int):
     ip_address = list(map(int, default_address.split('.')))
     ip_address: list[int] = [*ip_address[:-1], address_id]
@@ -29,11 +25,3 @@ def network_properties(network_range: tuple or str = None) -> tuple:
     server_ip = network_range.split('/')[0]
     subnet_mask = ".".join(map(str, subnet_mask))
     return server_ip, subnet_mask, network_range
-
-
-def set_routes(ip_address: str, network_range: tuple or str = None) -> None:
-    route, subnet_mask, network_range = network_properties(network_range)
-    windows = ["route", "add", route, "mask", subnet_mask, ip_address, "metric", "1"]
-    linux = ["sudo", "-S", "ip", "route", "add", network_range, "via", ip_address]
-    kwargs = dict(shell=True) if platform.system() != 'Linux' else dict()
-    subprocess.run(linux if platform.system() == 'Linux' else windows, **kwargs)

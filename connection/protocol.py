@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import time
@@ -198,10 +199,11 @@ class ServerHandshake(Handshake):
         if invalid: raise ValueError(error)
         return username.decode(), password.decode()
 
-    def configuration(self, state: dict, ip_address: str,
-                      subnet_mask: str, session_id: bytes) -> bytes:
-        def to_bytes(address): return bytes(map(int, address.split('.')))
-        content = to_bytes(ip_address) + to_bytes(subnet_mask) + session_id
+    def configuration(self, state: dict, networks: list,
+                      session_id: bytes) -> bytes:
+        # Configuration is encrypted, so network membership stays private.
+        content = json.dumps(networks, separators=(',', ':')).encode()
+        content = session_id + content
         arguments = state['keys']['server_handshake'], Protocol.configuration
         arguments += state['identifier'], content
         return self.encrypt(*arguments)
@@ -260,11 +262,17 @@ class ClientHandshake(Handshake):
         if identifier != self.identifier: raise ValueError('Invalid configuration packet')
         if packet_type == Protocol.error: raise ValueError(content.decode())
         error = 'Invalid configuration packet'
-        invalid = packet_type != Protocol.configuration or len(content) != 24
+        invalid = packet_type != Protocol.configuration or len(content) < 18
         if invalid: raise ValueError(error)
-
-        def decode(address): return '.'.join(str(n) for n in address)
-        ip_address, subnet_mask, session_id = content[:4], content[4:8], content[8:]
+        session_id, content = content[:16], content[16:]
+        try: networks = json.loads(content.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError): raise ValueError(error)
+        required = {'network_id', 'mode', 'ip_address', 'subnet_mask',
+                    'network_range', 'primary', 'routes'}
+        valid = type(networks) is list and len(networks) > 0
+        valid = valid and all(type(network) is dict for network in networks)
+        valid = valid and all(required <= network.keys() for network in networks)
+        valid = valid and sum(bool(network['primary']) for network in networks) == 1
+        if not valid: raise ValueError(error)
         arguments = session_id, self.keys['client'], self.keys['server']
-        cipher = PacketCipher(*arguments, client=True)
-        return decode(ip_address), decode(subnet_mask), cipher
+        return networks, PacketCipher(*arguments, client=True)

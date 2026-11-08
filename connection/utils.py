@@ -21,9 +21,53 @@ def network_properties(network_range: Optional[tuple or str] = None) -> tuple:
     return server_ip, subnet_mask, network_range
 
 
-def set_routes(ip_address: str, network_range: Optional[tuple or str] = None) -> None:
+def prefix_length(subnet_mask: str) -> int:
+    return sum(bin(int(octet)).count('1') for octet in subnet_mask.split('.'))
+
+
+def set_address(interface: str, ip_address: str, subnet_mask: str) -> None:
+    prefix = prefix_length(subnet_mask)
+    commands = {
+        'Linux': ['ip', 'address', 'add', f'{ip_address}/{prefix}',
+                  'dev', interface],
+        'Windows': ['netsh', 'interface', 'ipv4', 'add', 'address',
+                    f'name={interface}', f'address={ip_address}',
+                    f'mask={subnet_mask}'],
+        'Darwin': ['ifconfig', interface, 'alias', ip_address,
+                   'netmask', subnet_mask]
+    }
+    subprocess.run(commands[platform.system()], check=True)
+
+
+def set_routes(ip_address: str, network_range: Optional[tuple or str] = None,
+               interface: str = None) -> None:
     route, subnet_mask, network_range = network_properties(network_range)
-    windows = ["route", "add", route, "mask", subnet_mask, ip_address, "metric", "1"]
-    linux = ["sudo", "-S", "ip", "route", "add", network_range, "via", ip_address]
-    kwargs = dict(shell=True) if platform.system() != 'Linux' else dict()
-    subprocess.run(linux if platform.system() == 'Linux' else windows, **kwargs)
+    windows = ['route', 'add', route, 'mask', subnet_mask,
+               ip_address, 'metric', '1']
+    if interface:
+        linux = ['ip', 'route', 'replace', network_range, 'dev', interface,
+                 'src', ip_address]
+        darwin = ['route', '-n', 'add', '-net', network_range,
+                  '-interface', interface]
+    else:
+        linux = ['ip', 'route', 'replace', network_range, 'via', ip_address]
+        darwin = ['route', '-n', 'add', '-net', network_range, ip_address]
+    commands = dict(Linux=linux, Windows=windows, Darwin=darwin)
+    subprocess.run(commands[platform.system()], check=True)
+
+
+def configure_networks(interface: str, networks: list[dict]) -> None:
+    # One TUN owns every lease; routed networks only add a preferred route.
+    addresses = {network['ip_address'] for network in networks}
+    for network in networks:
+        assigned = network['mode'] == 'assigned' and not network['primary']
+        if assigned:
+            arguments = interface, network['ip_address'], network['subnet_mask']
+            set_address(*arguments)
+    for network in networks:
+        arguments = network['ip_address'], network['network_range'], interface
+        set_routes(*arguments)
+        for route in network['routes']:
+            if route.split('/')[0] in addresses: continue
+            arguments = network['ip_address'], route, interface
+            set_routes(*arguments)

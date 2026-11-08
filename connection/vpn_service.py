@@ -14,7 +14,8 @@ from scapy.layers.inet import IP
 from connection.database.mongodb import Account, Connection, Network
 from connection.monitor import SpeedMonitor
 from connection.protocol import ClientHandshake, PacketCipher, Protocol, ServerHandshake
-from connection.session import Session, SessionRegistry
+from connection.session import NetworkAccess, Session, SessionRegistry
+from connection.utils import configure_networks
 
 
 class VPNServer:
@@ -62,31 +63,105 @@ class VPNServer:
         for account_id, length in transferred.items():
             Account(collection, account_id).increment(transfer_ratio=length)
 
+    def _network_records(self, account: dict):
+        collection, records = self.table_name['networks'], []
+        for network_id, options in account['networks'].items():
+            if type(options) is not dict: return None
+            network = Network(collection, network_id)
+            details = network.get()
+            if not details: return None
+            mode = options.get('mode')
+            if mode not in (NetworkAccess.assigned, NetworkAccess.routed):
+                return None
+            subnet_mask = details.get('subnet_mask')
+            network_range = details.get('network_range')
+            routes = details.get('routes')
+            if not subnet_mask or not network_range: return None
+            if type(routes) is not dict: return None
+            records.append((network, details, options, mode))
+        return records
+
+    def _network_access(self, network: Network, details: dict,
+                        mode: str, ip_address: str, primary: bool = False):
+        routes = [f'{address}/32'
+                  for address in details['routes'].values()]
+        arguments = network.id, mode, ip_address, details['subnet_mask']
+        arguments += details['network_range'], routes, primary
+        try: return NetworkAccess(*arguments)
+        except ValueError: return None
+
+    def _assigned_accesses(self, account: dict, records: list):
+        assigned = [record for record in records
+                    if record[3] == NetworkAccess.assigned]
+        selected = [record for record in assigned if record[2].get('primary')]
+        if not assigned or len(selected) != 1: return None
+        primary_record = selected[0]
+        primary_id = primary_record[0].id
+        networks, identities = [], {}
+
+        for network, details, _, mode in assigned:
+            connections = details.get('connections', {})
+            ip_address = connections.get(account['_id'].__str__())
+            if not ip_address: return None
+            primary = network.id == primary_id
+            access = self._network_access(network, details, mode,
+                                          ip_address, primary)
+            if not access: return None
+            networks.append(access)
+            identities[network.id.__str__()] = access
+        return networks, identities, primary_id
+
+    def _routed_accesses(self, records: list, identities: dict,
+                         primary_id: ObjectId):
+        networks = []
+        for network, details, options, mode in records:
+            if mode != NetworkAccess.routed: continue
+            source_id = options.get('source')
+            if not source_id: return None
+            source = identities.get(source_id.__str__())
+            if not source: return None
+            access = self._network_access(network, details, mode,
+                                          source.ip_address)
+            if not access: return None
+            networks.append(access)
+        return networks
+
+    def network_accesses(self, account: dict):
+        # Membership modes are resolved once while the session is created.
+        records = self._network_records(account)
+        if not records: return None
+        assigned = self._assigned_accesses(account, records)
+        if not assigned: return None
+        networks, identities, primary_id = assigned
+        routed = self._routed_accesses(records, identities, primary_id)
+        if routed is None: return None
+        networks += routed
+
+        ranges = [network.network_range for network in networks]
+        if len(ranges) != len(set(ranges)): return None
+        # The primary lease stays first because it configures the TUN itself.
+        return sorted(networks, key=lambda network: not network.primary)
+
     def new_connection(self, credentials: tuple, address: tuple, keys: dict):
-        # Authenticate and load the virtual network during the control phase.
+        # Authenticate and load every virtual network during the control phase.
         account = self.authenticate(credentials)
         if not account or not account.get('networks'): return None
         account_id = account['_id']
-        network_id = list(account['networks'].keys())[0]
-        network = Network(self.table_name['networks'], network_id)
-        network_data = network.get()
-        if not network_data: return None
-        ip_address = network_data['connections'].get(account_id.__str__())
-        if not ip_address: return None
+        networks = self.network_accesses(account)
+        if not networks: return None
+
+        # Publication replaces any older session owned by this account.
+        session_id = os.urandom(16)
+        cipher = PacketCipher(session_id, keys['server'], keys['client'])
+        session = Session(account_id, networks, address, cipher)
+        try: self.registry.add_session(session)
+        except ValueError: return None
 
         # Persist public connection metadata without saving session keys.
         collection = self.table_name['connections']
         collection.delete_many({'account_id': account_id})
         account = Account(self.table_name['accounts'], account_id)
-        Connection(collection).create(network, account, ip_address, address)
-
-        # Publication replaces any older session owned by this account.
-        session_id = os.urandom(16)
-        cipher = PacketCipher(session_id, keys['server'], keys['client'])
-        arguments = account_id, network.id, ip_address, address
-        arguments += cipher, network_data['subnet_mask']
-        session = Session(*arguments)
-        self.registry.add_session(session)
+        Connection(collection).create(account, networks, address)
         return session
 
     def cleanup_handshakes(self):
@@ -121,7 +196,7 @@ class VPNServer:
         except (InvalidTag, UnicodeDecodeError, ValueError): return
         session = self.new_connection(credentials, address, state['keys'])
         if session:
-            arguments = state, session.ip_address, session.subnet_mask
+            arguments = state, session.configurations()
             arguments += session.cipher.session_id,
             reply = self.handshake.configuration(*arguments)
         else: reply = self.handshake.error_packet(state)
@@ -142,8 +217,9 @@ class VPNServer:
             self.receive_credentials(packet, address, state)
 
     def get_destination(self, session: Session, packet: bytes):
-        packet, registry = IP(packet), self.registry
-        return registry.get_route(session.network_id, packet.dst), packet
+        packet = IP(packet)
+        client = self.registry.get_destination(session, packet.src, packet.dst)
+        return client, packet
 
     def forward_packet(self, client: Session, packet: IP,
                        tunnel: bool):
@@ -166,6 +242,7 @@ class VPNServer:
         except (InvalidTag, ValueError): return
         try: client, packet = self.get_destination(session, packet)
         except Exception: return
+        if not session.owns_address(packet.src): return
         # Valid packets may safely refresh a connection changed by NAT.
         session.connection, session.last_packet = address, time.monotonic()
         self.update_transfer(session.account_id, len(packet))
@@ -197,6 +274,7 @@ class VPNClient:
             self.server_address = tuple(self.server_address)
         # Leave room for the UDP, protocol, counter, and authentication headers.
         self.mtu, self.cipher = 1420, None
+        self.networks = []
         self.connection = [self.server_address[0], '255.255.255.0']
         self.socket_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -220,9 +298,10 @@ class VPNClient:
         packet = self.exchange(handshake.hello())
         handshake.server_hello(packet)
         packet = self.exchange(handshake.credentials(username, password))
-        details = handshake.configuration(packet)
-        ip_address, subnet_mask, self.cipher = details
-        return ip_address, subnet_mask
+        self.networks, self.cipher = handshake.configuration(packet)
+        primary = next(network for network in self.networks if network['primary'])
+        self.connection = primary['ip_address'], primary['subnet_mask']
+        return self.networks
 
     def new_tunnel(self, interface: str):
         try: import pytun
@@ -234,9 +313,10 @@ class VPNClient:
 
     def connect(self, credentials: tuple, interface: str):
         tun = self.new_tunnel(interface)
-        self.connection = self.authenticate(*credentials)
+        networks = self.authenticate(*credentials)
         tun.addr, tun.netmask, tun.mtu = *self.connection, self.mtu
         tun.persist(True), tun.up()
+        configure_networks(interface, networks)
         self.speed_monitor.start_monitoring()
         while True:
             for source in select.select([tun, self.socket_server], [], [])[0]:

@@ -44,11 +44,16 @@ class ProtocolTest(unittest.TestCase):
     def test_configuration_creates_directional_ciphers(self):
         server, client, state = self.handshake()
         session_id = os.urandom(16)
-        packet = server.configuration(state, '192.168.1.2', '255.255.255.0', session_id)
-        ip_address, subnet_mask, client_cipher = client.configuration(packet)
+        networks = [dict(
+            network_id='65c64154b0f8142a7a9b4c31', mode='assigned',
+            ip_address='192.168.1.2', subnet_mask='255.255.255.0',
+            network_range='192.168.1.0/24', primary=True, routes=[]
+        )]
+        packet = server.configuration(state, networks, session_id)
+        configuration, client_cipher = client.configuration(packet)
         server_cipher = PacketCipher(session_id, state['keys']['server'], state['keys']['client'])
 
-        self.assertEqual((ip_address, subnet_mask), ('192.168.1.2', '255.255.255.0'))
+        self.assertEqual(configuration, networks)
         self.assertEqual(server_cipher.decrypt(client_cipher.encrypt(b'client packet')), b'client packet')
         self.assertEqual(client_cipher.decrypt(server_cipher.encrypt(b'server packet')), b'server packet')
 

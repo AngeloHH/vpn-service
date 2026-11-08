@@ -10,6 +10,8 @@ This project consists of a client and server VPN that allows you to create virtu
 - Credential Security: User passwords are not stored in plain text, ensuring enhanced security.
 - Transfer Statistics: Real-time statistics on the data transfer rate for each user account.
 - In-Memory Routing: Authenticated sessions and virtual routes stay in memory, so packets do not query MongoDB while being forwarded.
+- Multi-Network Sessions: One encrypted connection can enter several virtual networks through a single client TUN interface.
+- Flexible Network Identity: A membership can reserve an independent address or reuse an address assigned by another network.
 - Independent Virtual Networks: Each created network is independent, increasing user privacy.
 - Authenticated Encryption: Every packet uses ChaCha20-Poly1305 with a unique counter, an authentication tag, and replay protection.
 - Secure Handshake: X25519 creates ephemeral traffic keys and Ed25519 verifies the identity of the VPN server before credentials are sent.
@@ -50,12 +52,45 @@ credentials = 'Username', 'password123*'
 vpn_client.connect(credentials, 'my_interface')
 ```
 
+## Multiple Network Access
+
+An account keeps one encrypted session even when it can access several networks.
+The client places all assigned addresses and preferred routes on the same TUN
+interface. A network membership supports two modes:
+
+- `assigned`: the target network reserves and exposes its own address.
+- `routed`: the target network exposes an address already assigned by another
+  network and does not reserve an additional address.
+
+```python
+from connection.database.mongodb import Account, Network
+
+account = Account(database['accounts'], account_id)
+primary = Network(database['networks'], primary_network_id)
+secondary = Network(database['networks'], secondary_network_id)
+
+# The first option gives the account a different address in each network.
+primary.to_network(account, mode='assigned', primary=True)
+secondary.to_network(account, mode='assigned')
+
+# Use this instead when the secondary network must see the primary address.
+secondary.to_network(account, mode='routed', source_network=primary.id)
+```
+
+Routed identities require the target network's return traffic to pass through
+the VPN server. Networks attached to the same single TUN interface must use
+different ranges; duplicate ranges are rejected when the session is created.
+Membership changes take effect when the affected clients reconnect.
+
 ## Packet Protocol
 
 The handshake takes place over the same UDP socket in three exchanges. The client
 creates an ephemeral X25519 key, verifies the server's Ed25519 signature, and then
 sends its credentials encrypted. HKDF derives independent client-to-server and
 server-to-client keys without sending them through the network.
+
+The server returns the complete encrypted membership list, including assigned
+addresses, routed identities, network ranges, and return routes.
 
 Each data packet contains the protocol identifier, version, packet type, a random
 session ID, and a 64-bit packet counter. The header is authenticated together with
