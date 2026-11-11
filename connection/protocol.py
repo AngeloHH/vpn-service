@@ -14,7 +14,7 @@ class Protocol:
     magic, version = b'SVPN', 1
     client_hello, server_hello = 1, 2
     authentication, configuration = 3, 4
-    data, error = 5, 6
+    data, error, control = 5, 6, 7
     header = struct.Struct('!4sBB16s')
 
     @classmethod
@@ -76,19 +76,19 @@ class PacketCipher:
         self.send_direction = bytes([0, 0, 0, 1 if client else 2])
         self.recv_direction = bytes([0, 0, 0, 2 if client else 1])
 
-    def encrypt(self, packet: bytes) -> bytes:
+    def encrypt(self, packet: bytes, packet_type: int = Protocol.data) -> bytes:
         # A direction prefix and monotonic counter form the unique nonce.
         counter = self.counter.to_bytes(8, 'big')
         self.counter += 1
         nonce = self.send_direction + counter
         # The complete header is authenticated with the encrypted payload.
-        header = Protocol.pack(Protocol.data, self.session_id, counter)
+        header = Protocol.pack(packet_type, self.session_id, counter)
         encrypted = self.send_cipher.encrypt(nonce, packet, header)
         return header + encrypted
 
-    def decrypt(self, packet: bytes) -> bytes:
+    def decrypt(self, packet: bytes, packet_type: int = Protocol.data) -> bytes:
         # Read the public routing fields before authenticating the payload.
-        details = Protocol.unpack(packet, Protocol.data)
+        details = Protocol.unpack(packet, packet_type)
         identifier, encrypted, header = details[1:]
         error = 'Invalid encrypted packet'
         invalid = identifier != self.session_id or len(encrypted) < 24
@@ -199,13 +199,10 @@ class ServerHandshake(Handshake):
         if invalid: raise ValueError(error)
         return username.decode(), password.decode()
 
-    def configuration(self, state: dict, networks: list,
-                      session_id: bytes) -> bytes:
-        # Configuration is encrypted, so network membership stays private.
-        content = json.dumps(networks, separators=(',', ':')).encode()
-        content = session_id + content
+    def configuration(self, state: dict, session_id: bytes) -> bytes:
+        # Login only opens the session; networks are chosen through control.
         arguments = state['keys']['server_handshake'], Protocol.configuration
-        arguments += state['identifier'], content
+        arguments += state['identifier'], session_id
         return self.encrypt(*arguments)
 
     def error_packet(self, state: dict,
@@ -256,23 +253,42 @@ class ClientHandshake(Handshake):
         arguments += self.identifier, credentials
         return self.encrypt(*arguments)
 
-    def configuration(self, packet: bytes) -> tuple:
+    def configuration(self, packet: bytes) -> PacketCipher:
         details = self.decrypt(self.keys['server_handshake'], packet)
         packet_type, identifier, content = details
         if identifier != self.identifier: raise ValueError('Invalid configuration packet')
         if packet_type == Protocol.error: raise ValueError(content.decode())
         error = 'Invalid configuration packet'
-        invalid = packet_type != Protocol.configuration or len(content) < 18
+        invalid = packet_type != Protocol.configuration or len(content) != 16
         if invalid: raise ValueError(error)
-        session_id, content = content[:16], content[16:]
-        try: networks = json.loads(content.decode())
-        except (UnicodeDecodeError, json.JSONDecodeError): raise ValueError(error)
-        required = {'network_id', 'mode', 'ip_address', 'subnet_mask',
-                    'network_range', 'primary', 'routes'}
+        arguments = content, self.keys['client'], self.keys['server']
+        return PacketCipher(*arguments, client=True)
+
+
+class Control:
+    # Control messages share the session cipher but never reach the TUN.
+    list_networks, connect, disconnected = 'list', 'connect', 'disconnected'
+    # Unlike disconnected, kicked ends the login: the client must not reconnect.
+    kicked = 'kicked'
+    required = {'network_id', 'mode', 'ip_address', 'subnet_mask',
+                'network_range', 'primary', 'routes', 'server'}
+
+    @staticmethod
+    def pack(message: dict) -> bytes:
+        return json.dumps(message, separators=(',', ':')).encode()
+
+    @staticmethod
+    def unpack(content: bytes) -> dict:
+        try: message = json.loads(content.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError): message = None
+        if type(message) is not dict: raise ValueError('Invalid control message')
+        return message
+
+    @classmethod
+    def networks(cls, networks) -> list[dict]:
         valid = type(networks) is list and len(networks) > 0
         valid = valid and all(type(network) is dict for network in networks)
-        valid = valid and all(required <= network.keys() for network in networks)
+        valid = valid and all(cls.required <= network.keys() for network in networks)
         valid = valid and sum(bool(network['primary']) for network in networks) == 1
-        if not valid: raise ValueError(error)
-        arguments = session_id, self.keys['client'], self.keys['server']
-        return networks, PacketCipher(*arguments, client=True)
+        if not valid: raise ValueError('Invalid network configuration')
+        return networks

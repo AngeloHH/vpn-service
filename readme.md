@@ -82,6 +82,26 @@ the VPN server. Networks attached to the same single TUN interface must use
 different ranges; duplicate ranges are rejected when the session is created.
 Membership changes take effect when the affected clients reconnect.
 
+## Virtual Network HTTP Server
+
+Each virtual network can expose an HTTP server that exists entirely inside the
+VPN process. TCP is handled in memory by `tcp-sansio`; the operating system does
+not open a TCP port or create a server-side TUN adapter.
+
+```python
+http = vpn_server.add_virtual_http(
+    network_id, ip_address='192.168.1.1', port=80
+)
+
+@http.route('GET', '/')
+def index(request):
+    return 'Virtual router'
+```
+
+The address and port are stored in the network record, reserved from future
+client leases, and included in the encrypted configuration sent at login. Data
+packets still use the existing UDP tunnel and do not query MongoDB.
+
 ## Packet Protocol
 
 The handshake takes place over the same UDP socket in three exchanges. The client

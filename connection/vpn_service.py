@@ -1,7 +1,11 @@
+import hashlib
+import logging
 import os
+from collections import deque
 import select
 import socket
 import time
+from ipaddress import ip_address as parse_address, ip_network
 from threading import Lock, Thread
 from typing import Optional
 
@@ -11,17 +15,51 @@ from cryptography.exceptions import InvalidTag
 from pymongo import MongoClient
 from scapy.layers.inet import IP
 
-from connection.database.mongodb import Account, Connection, Network
+from connection import __version__
+from connection.admin.auth import WebSessions
+from connection.database.mongodb import Account, Connection, Member, Network, Organization
+from connection.database.mongodb.networks import router_address
 from connection.monitor import SpeedMonitor
-from connection.protocol import ClientHandshake, PacketCipher, Protocol, ServerHandshake
+from connection.egress import Egress
+from connection.forwarding import Forwarding
+from connection.firewall import Firewall
+from connection.usage import Usage
+from connection.events import INFO, WARN, Events
+from connection.limits import QUOTAS, resolve
+from connection.network_admin import NetworkAdmin
+from connection.organizations import Organizations
+from connection.role_admin import RoleAdmin
+from connection.access_admin import AccessAdmin
+from connection.security_admin import SecurityAdmin
+from connection.backup_admin import BackupAdmin
+from connection.protocol import (ClientHandshake, Control, PacketCipher,
+                                 Protocol, ServerHandshake)
 from connection.session import NetworkAccess, Session, SessionRegistry
-from connection.utils import configure_networks
+from connection.system import MODEL, ProcessMetrics
+from connection.tcp_bridge import VirtualHTTPBridge
+from connection.utils import configure_networks, remove_networks
+from connection.virtual_http import VirtualHTTPServer
+
+logger = logging.getLogger(__name__)
 
 
 class VPNServer:
     def __init__(self, mongo_client: MongoClient, table_name: str,
-                 private_key: bytes or str = None):
+                 private_key: bytes or str = None, public: bool = False,
+                 internet: bool = False):
         self.table_name = mongo_client[table_name]
+        # The server's own switch: without it no network can reach the internet.
+        self.internet = internet
+        # Public servers open registration; local ones accept added emails only.
+        self.public, self.organizations = public, Organizations(self.table_name)
+        self.started, self.metrics = None, {}
+        self.web_sessions = WebSessions()
+        # Byte totals per organization become a per-second traffic history.
+        self.traffic, self.traffic_history = {}, {}
+        self.last_sample, self.sample_interval = None, 1.0
+        # Worker threads wake the packet loop when deferred HTTP work ends.
+        self.waker = socket.socketpair()
+        self.waker[1].setblocking(False)
         self.ip_address = '0.0.0.0'
         self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Keep a stable server identity around every ephemeral handshake.
@@ -30,7 +68,20 @@ class VPNServer:
         self.max_handshakes = 1024
         self.private_key = self.handshake.private_key.hex()
         # Sessions and routes are the in-memory packet data plane.
-        self.handshakes, self.registry = {}, SessionRegistry()
+        self.events = Events()
+        self.usage = Usage(lambda: self.table_name['usage'])
+        self.egress = Egress(lambda session, packet: self.deliver(session, packet, 'internet'),
+                             notify=self.egress_warning)
+        self.forwarding, self.firewall = Forwarding(), Firewall()
+        self.handshakes, self.registry = {}, SessionRegistry(self.released)
+        self.bridges = {}
+        # Changes apply between loop iterations, after pending responses left.
+        self.panel, self.pending_changes = None, []
+        self.network_admin = NetworkAdmin(self.organizations, lambda: self.internet)
+        self.role_admin = RoleAdmin(self.organizations)
+        self.access_admin = AccessAdmin(self.network_admin)
+        self.security_admin = SecurityAdmin(self.network_admin)
+        self.backup_admin = BackupAdmin(self.network_admin, self.access_admin, self.security_admin)
         self.last_cleanup = time.monotonic()
         # Transfer counters defer database writes beyond the packet path.
         self.transferred, self.transfer_lock = {}, Lock()
@@ -87,82 +138,270 @@ class VPNServer:
                   for address in details['routes'].values()]
         arguments = network.id, mode, ip_address, details['subnet_mask']
         arguments += details['network_range'], routes, primary
-        try: return NetworkAccess(*arguments)
+        organization_id = details.get('organization_id')
+        try: return NetworkAccess(*arguments, server=details.get('server'),
+                                  organization_id=organization_id,
+                                  internet=self.internet and details.get('internet') is True,
+                                  dns=details.get('dns') or [])
         except ValueError: return None
 
-    def _assigned_accesses(self, account: dict, records: list):
-        assigned = [record for record in records
-                    if record[3] == NetworkAccess.assigned]
-        selected = [record for record in assigned if record[2].get('primary')]
-        if not assigned or len(selected) != 1: return None
-        primary_record = selected[0]
-        primary_id = primary_record[0].id
-        networks, identities = [], {}
-
-        for network, details, _, mode in assigned:
+    def _assigned_access(self, account: dict, records: list,
+                         network_id: str):
+        for network, details, _, mode in records:
+            selected = network.id.__str__() == network_id
+            if mode != NetworkAccess.assigned or not selected: continue
             connections = details.get('connections', {})
             ip_address = connections.get(account['_id'].__str__())
             if not ip_address: return None
-            primary = network.id == primary_id
-            access = self._network_access(network, details, mode,
-                                          ip_address, primary)
-            if not access: return None
-            networks.append(access)
-            identities[network.id.__str__()] = access
-        return networks, identities, primary_id
+            return self._network_access(network, details, mode, ip_address, True)
 
-    def _routed_accesses(self, records: list, identities: dict,
-                         primary_id: ObjectId):
-        networks = []
+    def _routed_accesses(self, records: list, source: NetworkAccess):
+        networks, source_id = [], source.network_id.__str__()
         for network, details, options, mode in records:
             if mode != NetworkAccess.routed: continue
-            source_id = options.get('source')
-            if not source_id: return None
-            source = identities.get(source_id.__str__())
-            if not source: return None
+            if options.get('source').__str__() != source_id: continue
             access = self._network_access(network, details, mode,
                                           source.ip_address)
             if not access: return None
             networks.append(access)
         return networks
 
-    def network_accesses(self, account: dict):
-        # Membership modes are resolved once while the session is created.
+    def network_options(self, account: dict) -> list[dict]:
+        # The menu identifies choices; addresses are only applied from connect.
+        records, options = self._network_records(account) or [], []
+        account_id = account['_id'].__str__()
+        for network, details, membership, mode in records:
+            if mode != NetworkAccess.assigned: continue
+            network_id = network.id.__str__()
+            routed = [record[0].id.__str__() for record in records
+                      if record[2].get('source').__str__() == network_id]
+            ip_address = details.get('connections', {}).get(account_id)
+            organization_id = details.get('organization_id')
+            options.append(dict(
+                network_id=network_id, network_range=details['network_range'],
+                ip_address=ip_address, routed=routed,
+                default=bool(membership.get('primary')),
+                organization_id=organization_id and organization_id.__str__()
+            ))
+        return options
+
+    def network_accesses(self, account: dict, network_id: ObjectId or str):
+        # One assigned identity plus every routed network that reuses it.
         records = self._network_records(account)
         if not records: return None
-        assigned = self._assigned_accesses(account, records)
-        if not assigned: return None
-        networks, identities, primary_id = assigned
-        routed = self._routed_accesses(records, identities, primary_id)
+        primary = self._assigned_access(account, records, network_id.__str__())
+        if not primary: return None
+        routed = self._routed_accesses(records, primary)
         if routed is None: return None
-        networks += routed
-
+        networks = [primary] + routed
         ranges = [network.network_range for network in networks]
-        if len(ranges) != len(set(ranges)): return None
-        # The primary lease stays first because it configures the TUN itself.
-        return sorted(networks, key=lambda network: not network.primary)
+        return networks if len(ranges) == len(set(ranges)) else None
+
+    def add_virtual_http(self, network_id, ip_address: str = None,
+                         port: int = None, server: VirtualHTTPServer = None):
+        network = Network(self.table_name['networks'], network_id)
+        details = network.get()
+        if not details: raise ValueError('The virtual network does not exist')
+        configuration = details.get('server') or {}
+        ip_address = ip_address or configuration.get('ip_address') or router_address(details['network_range'])
+        port = configuration.get('port', 80) if port is None else port
+        if not ip_address: raise ValueError('The virtual server address is required')
+        network_range = ip_network(details['network_range'], strict=False)
+        address = parse_address(ip_address)
+        reserved = list(details.get('connections', {}).values())
+        reserved += list(details.get('routes', {}).values())
+        if address not in network_range or ip_address in reserved:
+            raise ValueError('The virtual server address is not available')
+        if network.id in self.bridges:
+            raise ValueError('The virtual network already has an HTTP server')
+        bridge = VirtualHTTPBridge(network.id, ip_address, port, server)
+        try: network.update(server=dict(ip_address=ip_address, port=port))
+        except Exception:
+            bridge.close()
+            raise
+        bridge.server.notify = self.wake_loop
+        self.bridges[network.id] = bridge
+        return bridge.server
+
+    def close(self):
+        for resource in (self.server, *self.waker): resource.close()
+
+    def wake_loop(self):
+        try: self.waker[1].send(b'\0')
+        except (BlockingIOError, OSError): pass
+
+    def get_bridge(self, session: Session, source: str, destination: str):
+        for network in session.networks.values():
+            if network.ip_address != source: continue
+            bridge = self.bridges.get(network.network_id)
+            if bridge and bridge.ip_address == destination: return bridge
+
+    def forward_bridge(self, bridge: VirtualHTTPBridge, packets: list[bytes]):
+        for packet in packets:
+            if len(packet) < 20: continue
+            client = self.registry.get_route(bridge.network_id, socket.inet_ntoa(packet[16:20]))
+            if client: self.deliver(client, packet)
+
+    def bridge_timeout(self):
+        delays = [bridge.next_timeout() for bridge in self.bridges.values()]
+        delays = [delay for delay in delays if delay is not None]
+        return min(delays) if delays else None
+
+    def advance_bridges(self):
+        for bridge in list(self.bridges.values()):
+            self.forward_bridge(bridge, bridge.advance())
+        while self.pending_changes: self.complete_change(self.pending_changes.pop(0))
+
+    def add_panel(self, network_id, server: VirtualHTTPServer = None):
+        # Every network serves the panel at its router address.
+        http = self.add_virtual_http(network_id, server=server)
+        if self.panel and not server: self.panel(http, self)
+        return http
+
+    def change_panel(self, action: str, network_id):
+        bridge = self.bridges.pop(network_id, None)
+        if bridge: bridge.close()
+        if action == 'remove' and bridge and bridge.server.executor:
+            bridge.server.executor.shutdown(wait=False)
+        if action == 'remove': return
+        # A moved panel keeps its routes, timers and open streams' server.
+        try: self.add_panel(network_id, bridge.server if bridge else None)
+        except ValueError: logger.exception('The panel could not start')
+
+    def apply_change(self, change: dict):
+        # The answer leaves first: releasing routes now would strand it.
+        self.pending_changes.append(change)
+        self.wake_loop()
+
+    def complete_change(self, change: dict):
+        # MongoDB already holds the change; live sessions and panels follow it.
+        for account_id in change.get('kick', []): self.kick(account_id)
+        for account_id in change.get('disconnect', []): self.disconnect(account_id)
+        for account_id, network_id in change.get('reconnect', []): self.reconnect(account_id, network_id)
+        if change.get('forwards'): self.forwarding.install(*change['forwards'])
+        if change.get('firewall'): self.firewall.install(*change['firewall'])
+        if change.get('limits'): self.refresh_limits(change['organization_id'], *change['limits'])
+        if change.get('extra'): self.usage.set_extra(*change['extra'])
+        if change.get('panel'): self.change_panel(*change['panel'])
+        for action, network_id in change.get('panels', []): self.change_panel(action, network_id)
+        for account_id in change.get('refresh', []): self.refresh_member(change['organization_id'], account_id)
+
+    def reconnect(self, account_id, network_id):
+        # Only a session connected through that network gets a new configuration.
+        session = self.registry.get_account(ObjectId(account_id.__str__()))
+        primary = session and next((network for network in session.networks.values() if network.primary), None)
+        if primary and primary.network_id.__str__() == network_id.__str__(): self.disconnect(account_id)
+
+    def load_forwards(self):
+        # At start: every organization's forwards and rules between members, as the panel left them.
+        for organization_id in {network.get('organization_id') for network in self.table_name['networks'].find({})}:
+            if not organization_id: continue
+            self.forwarding.install(organization_id, self.access_admin.table(organization_id))
+            self.firewall.install(organization_id, self.security_admin.table(organization_id))
+
+    def refresh_member(self, organization_id, account_id):
+        # A new role or new permissions reach the open session without reconnecting it.
+        session = self.registry.get_account(ObjectId(account_id.__str__()))
+        if not session or session.organization_id != organization_id: return
+        try: session.permissions = self.organizations.permissions(session.account_id, organization_id)
+        except PermissionError: session.permissions = None
+        self.apply_limits(session, session.limited_network)
 
     def new_connection(self, credentials: tuple, address: tuple, keys: dict):
-        # Authenticate and load every virtual network during the control phase.
+        # A login only opens the session; it gains routes on connect.
         account = self.authenticate(credentials)
-        if not account or not account.get('networks'): return None
-        account_id = account['_id']
-        networks = self.network_accesses(account)
-        if not networks: return None
-
-        # Publication replaces any older session owned by this account.
+        if not account: return None
         session_id = os.urandom(16)
         cipher = PacketCipher(session_id, keys['server'], keys['client'])
-        session = Session(account_id, networks, address, cipher)
-        try: self.registry.add_session(session)
-        except ValueError: return None
+        session = Session(account['_id'], address, cipher)
+        session.username, session.email = account.get('username'), account.get('email')
+        self.registry.add_session(session)
+        return session
+
+    def activate(self, session: Session, account: dict, network_id) -> dict:
+        # Read the configuration now, so a stale menu never assigns an address.
+        valid = type(network_id) is str and ObjectId.is_valid(network_id)
+        networks = self.network_accesses(account, network_id) if valid else None
+        if not networks: return dict(error='The network is not available')
+        blocked = networks[0].organization_id and self.organizations.is_blocked(
+            session.account_id, networks[0].organization_id)
+        if blocked: return dict(error='The account is blocked in this organization')
+        try: self.registry.set_networks(session, networks)
+        except ValueError as error: return dict(error=str(error))
+        # Panel permissions are cached so HTTP requests never query MongoDB.
+        organization_id, session.permissions = networks[0].organization_id, None
+        session.organization_id, session.connected_at = organization_id, time.monotonic()
+        if organization_id:
+            try: session.permissions = self.organizations.permissions(
+                session.account_id, organization_id)
+            except PermissionError: pass
+        primary = next(network for network in networks if network.primary)
+        self.apply_limits(session, primary.network_id)
+        self.events.record(organization_id, INFO, 'connected', primary.network_id,
+                           username=session.username, ip=primary.ip_address)
 
         # Persist public connection metadata without saving session keys.
         collection = self.table_name['connections']
-        collection.delete_many({'account_id': account_id})
-        account = Account(self.table_name['accounts'], account_id)
-        Connection(collection).create(account, networks, address)
-        return session
+        collection.delete_many({'account_id': session.account_id})
+        account = Account(self.table_name['accounts'], session.account_id)
+        Connection(collection).create(account, networks, session.connection)
+        return dict(configuration=session.configurations())
+
+    def control_reply(self, session: Session, message: dict) -> dict:
+        action, reply = message.get('action'), dict(request=message['request'])
+        account = Account(self.table_name['accounts'], session.account_id).get()
+        if not account: reply.update(error='The account does not exist')
+        elif action == Control.list_networks:
+            reply.update(networks=self.network_options(account))
+        elif action == Control.connect:
+            reply.update(self.activate(session, account, message.get('network_id')))
+        else: reply.update(error='Unknown control action')
+        return reply
+
+    def send_control(self, session: Session, message: dict):
+        packet = session.cipher.encrypt(Control.pack(message), Protocol.control)
+        self.server.sendto(packet, session.connection)
+
+    def receive_control(self, connection: tuple[bytes, any]):
+        packet, address = connection
+        session_id = Protocol.unpack(packet, Protocol.control)[1]
+        session = self.registry.get_session(session_id)
+        if not session: return
+        try: message = Control.unpack(session.cipher.decrypt(packet, Protocol.control))
+        except (InvalidTag, ValueError): return
+        session.packets += 1
+        request = message.get('request')
+        if type(request) is not int or request < session.request: return
+        session.connection, session.last_packet = address, time.monotonic()
+        # A retransmitted request receives the same reply without side effects.
+        if request > session.request:
+            session.request = request
+            session.reply = self.control_reply(session, message)
+        self.send_control(session, session.reply)
+
+    def disconnect(self, account_id: ObjectId or str):
+        # The login survives; only routes are released and the client told.
+        session = self.registry.get_account(ObjectId(account_id.__str__()))
+        if not session or not session.networks: return
+        self.registry.clear_networks(session)
+        collection = self.table_name['connections']
+        collection.delete_many({'account_id': session.account_id})
+        self.send_control(session, dict(action=Control.disconnected))
+
+    def kick(self, account_id: ObjectId or str):
+        # The login ends here; the client is told not to reconnect by itself.
+        session = self.registry.get_account(ObjectId(account_id.__str__()))
+        if not session: return
+        self.send_control(session, dict(action=Control.kicked))
+        self.registry.remove_session(session.account_id)
+        collection = self.table_name['connections']
+        collection.delete_many({'account_id': session.account_id})
+
+    def change_account(self, account_id: ObjectId or str, change):
+        # Persist first: a failed write leaves the live session untouched.
+        result = change()
+        self.disconnect(account_id)
+        return result
 
     def cleanup_handshakes(self):
         # Bound unauthenticated state retained for UDP handshakes.
@@ -196,8 +435,7 @@ class VPNServer:
         except (InvalidTag, UnicodeDecodeError, ValueError): return
         session = self.new_connection(credentials, address, state['keys'])
         if session:
-            arguments = state, session.configurations()
-            arguments += session.cipher.session_id,
+            arguments = state, session.cipher.session_id
             reply = self.handshake.configuration(*arguments)
         else: reply = self.handshake.error_packet(state)
         # Cache this encrypted reply so repeated UDP requests are harmless.
@@ -221,38 +459,239 @@ class VPNServer:
         client = self.registry.get_destination(session, packet.src, packet.dst)
         return client, packet
 
-    def forward_packet(self, client: Session, packet: IP,
-                       tunnel: bool):
-        # Every destination owns independent traffic keys.
-        if client:
-            packet = client.cipher.encrypt(bytes(packet))
-            self.server.sendto(packet, client.connection)
-            self.update_transfer(client.account_id, len(packet))
-        elif tunnel:
-            port = getattr(packet, 'dport', 0)
-            self.server.sendto(bytes(packet), (packet.dst, port))
+    def apply_limits(self, session: Session, network_id):
+        # The connection's main network decides the network limit, routed ones included.
+        organization_id = session.organization_id
+        member = Member(self.organizations.members).get(
+            organization_id=organization_id, account_id=session.account_id) if organization_id else None
+        session.role_id, session.limited_network = (member or {}).get('role_id'), network_id
+        network = Network(self.table_name['networks'], network_id).get() or {}
+        organization = Organization(self.table_name['organizations'], organization_id).get() or {} \
+            if organization_id else {}
+        session.limiter.set(resolve(network.get('limits'), session.role_id, session.account_id),
+                            resolve(organization.get('internet_limits'), session.role_id, session.account_id))
+        if not organization_id: return
+        # The month's consumption is loaded now, so the packet path never reads MongoDB.
+        account_id = session.account_id.__str__()
+        keys = dict(network=(organization_id.__str__(), account_id, network_id.__str__()),
+                    internet=(organization_id.__str__(), account_id, 'internet'))
+        for key in keys.values(): self.usage.spent(key)
+        # Extras of this month: the person's own and its role's, per scope.
+        owners = [('account', account_id)] + ([('role', session.role_id.__str__())] if session.role_id else [])
+        extras = {scope: [(organization_id.__str__(), kind, owner, key[2]) for kind, owner in owners]
+                  for scope, key in keys.items()}
+        for scope_keys in extras.values():
+            for key in scope_keys: self.usage.load_extra(key)
+        session.limiter.bind(self.usage, keys, lambda scope, direction: self.quota_reached(session, scope, direction),
+                             extras)
+        session.limiter.set_quotas(
+            resolve(network.get('limits'), session.role_id, session.account_id, QUOTAS),
+            resolve(organization.get('internet_limits'), session.role_id, session.account_id, QUOTAS))
 
-    def send_packet(self, tunnel: bool, connection: tuple[bytes, any]):
+    def quota_reached(self, session: Session, scope: str, direction: str):
+        self.events.record(session.organization_id, WARN, 'quota_reached', session.limited_network,
+                           username=session.username, scope=scope, direction=direction)
+
+    def refresh_limits(self, organization_id, kind: str, network_id, limits: dict):
+        # New limits reach connected members at once, without reconnecting them.
+        for session in list(self.registry.sessions.values()):
+            if session.organization_id != organization_id: continue
+            values = resolve(limits, session.role_id, session.account_id)
+            quotas = resolve(limits, session.role_id, session.account_id, QUOTAS)
+            if kind == 'internet': session.limiter.set(internet=values), session.limiter.set_quotas(internet=quotas)
+            elif session.limited_network == network_id:
+                session.limiter.set(network=values), session.limiter.set_quotas(network=quotas)
+
+    def egress_warning(self, session: Session, kind: str):
+        primary = next((network for network in session.networks.values() if network.primary), None)
+        self.events.record(session.organization_id, WARN, kind,
+                           primary.network_id if primary else None, username=session.username)
+
+    def deliver(self, client: Session, content: bytes, through: str = None):
+        # through: 'network' or 'internet' spend the receiver's buckets; the panel does not.
+        if through and not client.limiter.allow('down', len(content), through == 'internet'): return
+        # Every destination owns independent traffic keys.
+        packet = client.cipher.encrypt(content)
+        self.server.sendto(packet, client.connection)
+        self.update_transfer(client.account_id, len(packet))
+        self.count_traffic(client, len(content), True)
+
+    def send_packet(self, connection: tuple[bytes, any]):
         packet, address = connection
         session_id = Protocol.unpack(packet, Protocol.data)[1]
         session = self.registry.get_session(session_id)
         if not session: return
         # Authentication is completed before parsing the inner IP packet.
-        try: packet = session.cipher.decrypt(packet)
+        try: raw = session.cipher.decrypt(packet)
         except (InvalidTag, ValueError): return
-        try: client, packet = self.get_destination(session, packet)
+        session.packets += 1
+        # Data without routes means the client missed a disconnection notice.
+        if not session.networks:
+            session.connection = address
+            self.send_control(session, dict(action=Control.disconnected))
+            return
+        try: packet = IP(raw)
         except Exception: return
         if not session.owns_address(packet.src): return
         # Valid packets may safely refresh a connection changed by NAT.
         session.connection, session.last_packet = address, time.monotonic()
         self.update_transfer(session.account_id, len(packet))
-        self.forward_packet(client, packet, tunnel)
+        self.count_traffic(session, len(packet), False)
+        if self.forward(session, packet.dst, raw): return
+        bridge = self.get_bridge(session, packet.src, packet.dst)
+        if bridge:
+            try: packets = bridge.receive(bytes(packet))
+            except (ValueError, ConnectionError, KeyError): return
+            self.forward_bridge(bridge, packets)
+            return
+        network_id, client = self.registry.find_destination(session, packet.src, packet.dst)
+        if client:
+            # Seguridad: the network's rules between members decide first.
+            if not self.firewall.allows(network_id, session, client, raw): return
+            if not session.limiter.allow('up', len(raw)): return
+            return self.deliver(client, bytes(packet), 'network')
+        # Outside every network of the session: the internet, if a network allows it.
+        if self.internet and session.internet and not session.inside(packet.dst):
+            # The network limit applies first; the internet limit adds to it.
+            if not session.limiter.allow('up', len(raw), True): return
+            self.egress.outbound(session, raw)
 
-    def run_server(self, port: int = 5732, tunnel: bool = False):
+    def released(self, session: Session):
+        # The session lost its routes: whatever depended on them ends.
+        self.egress.drop(session)
+        self.forwarding.drop(session)
+
+    def forward(self, session: Session, destination: str, raw: bytes) -> bool:
+        # True when a forwarding rule, or the answer to one, took the packet.
+        # Every network of a session shares its one address, already checked.
+        for network in session.networks.values():
+            bridge = self.bridges.get(network.network_id)
+            # Answers come back to the panel address, on a translated port.
+            if bridge and bridge.ip_address == destination:
+                found = self.forwarding.inbound(network.network_id, raw)
+                if not found: continue
+                entry, packet = found
+                if session.limiter.allow('up', len(raw)): self.deliver(entry.client, packet, 'network')
+                return True
+            if not self.forwarding.listens(network.network_id, destination): continue
+            rule = self.forwarding.rule_for(network.network_id, raw)
+            if rule and rule.get('target_network') is None:
+                # Towards the internet: the network itself must let it out.
+                if network.internet and session.limiter.allow('up', len(raw), True):
+                    self.egress.outbound(session, raw, lambda protocol, reached: self.forwarding.destination(rule, reached[1]))
+            elif rule:
+                self.forward_inside(session, network.network_id, raw, rule)
+            return True
+        return False
+
+    def forward_inside(self, session: Session, network_id, raw: bytes, rule: dict):
+        bridge = self.bridges.get(rule['target_network'])
+        if not bridge: return
+        translated = self.forwarding.outbound(session, network_id, raw, bridge.ip_address)
+        if not translated: return
+        entry, packet = translated
+        target = self.registry.get_route(entry.network_id, entry.target[0])
+        if target and session.limiter.allow('up', len(raw)): self.deliver(target, packet, 'network')
+
+    def count_traffic(self, session: Session, length: int, sent: bool):
+        # Only additions on the packet path; rates are derived once per second.
+        totals = self.traffic.setdefault(session.organization_id, [0, 0])
+        totals[sent] += length
+        if sent: session.sent += length
+        else: session.received += length
+
+    def sample_traffic(self, now: float = None):
+        now = time.monotonic() if now is None else now
+        if self.last_sample is None:
+            self.last_sample = now, {key: list(value) for key, value in self.traffic.items()}
+            return
+        before, previous = self.last_sample
+        elapsed = now - before
+        if elapsed < self.sample_interval: return
+        for session in self.registry.sessions.values(): self.sample_session(session, elapsed)
+        # Download is what clients receive; upload is what they send, in kbps.
+        for organization_id, (received, sent) in self.traffic.items():
+            old_received, old_sent = previous.get(organization_id, (0, 0))
+            rate = lambda delta: round(delta * 8 / 1000 / elapsed, 1)
+            history = self.traffic_history.setdefault(organization_id, deque(maxlen=60))
+            history.append((rate(sent - old_sent), rate(received - old_received)))
+        self.last_sample = now, {key: list(value) for key, value in self.traffic.items()}
+
+    @staticmethod
+    def sample_session(session: Session, elapsed: float):
+        # Gaps in the client's packet counters are packets lost on the way.
+        counter = session.cipher.replay.counter
+        current = session.sent, session.received, session.packets, counter
+        if session.sampled:
+            sent, received, packets, last = (now - before for now, before
+                                             in zip(current, session.sampled))
+            rate = lambda delta: round(delta * 8 / 1000 / elapsed, 1)
+            session.rates = rate(sent), rate(received)
+            if last > 0: session.loss = round(max(0.0, 1 - packets / last) * 100, 1)
+        session.sampled = current
+
+    def traffic_delay(self, now: float = None):
+        if self.last_sample is None: return 0.0
+        now = time.monotonic() if now is None else now
+        return max(0.0, self.last_sample[0] + self.sample_interval - now)
+
+    def collect_metrics(self, interval: float = 5):
+        # Slow probes run here; requests only read the latest snapshot.
+        metrics = ProcessMetrics()
+        while True:
+            time.sleep(interval)
+            self.metrics = metrics.sample()
+
+    def status(self, organization_id: ObjectId) -> dict:
+        sessions = [session for session in self.registry.sessions.values()
+                    if any(network.organization_id == organization_id
+                           for network in session.networks.values())]
+        uptime = None if self.started is None else time.monotonic() - self.started
+        history = self.traffic_history.get(organization_id, ())
+        online = {}
+        for session in sessions:
+            for network in session.networks.values():
+                if network.organization_id != organization_id: continue
+                key = network.network_id.__str__()
+                online[key] = online.get(key, 0) + 1
+        serial = hashlib.sha256(self.handshake.public_key).hexdigest()[:10].upper()
+        return dict(
+            model=MODEL, firmware=__version__, serial=serial,
+            mode='public' if self.public else 'local',
+            time=time.strftime('%Y-%m-%d %H:%M:%S'),
+            # The operating system's zone: quotas restart on the 1st by this clock.
+            timezone=dict(name=time.strftime('%Z'), offset=time.strftime('%z')),
+            uptime=None if uptime is None else int(uptime), sessions=len(sessions),
+            cpu=self.metrics.get('cpu'), memory=self.metrics.get('memory'),
+            memory_percent=self.metrics.get('memory_percent'),
+            temperature=self.metrics.get('temperature'),
+            traffic=dict(down=[sample[0] for sample in history],
+                         up=[sample[1] for sample in history]),
+            online=online
+        )
+
+    def run_server(self, port: int = 5732):
         self.server.bind((self.ip_address, port))
+        self.started = time.monotonic()
         Thread(target=self.save_transfer, daemon=True).start()
+        Thread(target=self.collect_metrics, daemon=True).start()
+        Thread(target=self.usage.write_forever, daemon=True).start()
         # Own cipher counters and packet order.
         while True:
+            delays = [self.bridge_timeout(), self.traffic_delay(), self.egress.next_timeout()]
+            timeout = min(delay for delay in delays if delay is not None)
+            sources = [self.server, self.waker[0], *self.egress.readers()]
+            selected = select.select(sources, self.egress.writers(), self.egress.failures(), timeout)
+            readable = selected[0]
+            if self.waker[0] in readable: self.waker[0].recv(4096)
+            self.egress.ready(*selected)
+            self.egress.advance()
+            self.forwarding.advance()
+            self.firewall.advance()
+            self.usage.tick()
+            self.advance_bridges()
+            self.sample_traffic()
+            if self.server not in readable: continue
             connection = self.server.recvfrom(65535)
             self.cleanup_handshakes()
             try: packet_type = Protocol.packet_type(connection[0])
@@ -260,7 +699,9 @@ class VPNServer:
             if packet_type in (Protocol.client_hello, Protocol.authentication):
                 self.receive_handshake(connection)
             elif packet_type == Protocol.data:
-                self.send_packet(tunnel, connection)
+                self.send_packet(connection)
+            elif packet_type == Protocol.control:
+                self.receive_control(connection)
 
 
 class VPNClient:
@@ -274,9 +715,14 @@ class VPNClient:
             self.server_address = tuple(self.server_address)
         # Leave room for the UDP, protocol, counter, and authentication headers.
         self.mtu, self.cipher = 1420, None
-        self.networks = []
+        self.networks, self.network_id = [], None
+        self.tun, self.interface = None, None
+        self.request_id, self.error = 0, None
+        self.disconnected, self.kicked = False, False
         self.connection = [self.server_address[0], '255.255.255.0']
         self.socket_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Commands from other threads enter the tunnel loop through select().
+        self.commands = socket.socketpair()
 
     def exchange(self, packet: bytes, attempts: int = 3,
                  timeout: int = 3) -> bytes:
@@ -292,16 +738,80 @@ class VPNClient:
         finally: self.socket_server.settimeout(previous_timeout)
         raise TimeoutError('The server did not complete the handshake')
 
-    def authenticate(self, username: str, password: str) -> tuple:
+    def authenticate(self, username: str, password: str) -> PacketCipher:
         # Verify server identity before placing credentials on the wire.
         handshake = ClientHandshake(self.server_key)
         packet = self.exchange(handshake.hello())
         handshake.server_hello(packet)
         packet = self.exchange(handshake.credentials(username, password))
-        self.networks, self.cipher = handshake.configuration(packet)
-        primary = next(network for network in self.networks if network['primary'])
+        self.cipher, self.request_id = handshake.configuration(packet), 0
+        return self.cipher
+
+    def receive(self, packet: bytes):
+        # Data reaches the TUN; control messages return to the caller.
+        try: packet_type = Protocol.packet_type(packet)
+        except ValueError: return None
+        if packet_type not in (Protocol.data, Protocol.control): return None
+        try: content = self.cipher.decrypt(packet, packet_type)
+        except (InvalidTag, ValueError): return None
+        if packet_type == Protocol.data:
+            if self.tun and content:
+                self.speed_monitor.update_transfer(self.tun.write(content), 0)
+            return None
+        try: message = Control.unpack(content)
+        except ValueError: return None
+        if message.get('action') == Control.disconnected: self.disconnected = True
+        if message.get('action') == Control.kicked: self.kicked = True
+        return message
+
+    def request(self, action: str, attempts: int = 3, timeout: int = 3,
+                **fields) -> dict:
+        self.request_id += 1
+        message = Control.pack(dict(request=self.request_id, action=action, **fields))
+        previous_timeout = self.socket_server.gettimeout()
+        try:
+            for _ in range(attempts):
+                # Each retry needs a fresh counter; the request number stays.
+                packet = self.cipher.encrypt(message, Protocol.control)
+                self.socket_server.sendto(packet, self.server_address)
+                deadline = time.monotonic() + timeout
+                while (remaining := deadline - time.monotonic()) > 0:
+                    self.socket_server.settimeout(remaining)
+                    try: response, address = self.socket_server.recvfrom(65535)
+                    except socket.timeout: break
+                    if address != self.server_address: continue
+                    reply = self.receive(response)
+                    if reply and reply.get('request') == self.request_id: return reply
+        finally: self.socket_server.settimeout(previous_timeout)
+        raise TimeoutError('The server did not answer the control request')
+
+    def list_networks(self) -> list[dict]:
+        reply = self.request(Control.list_networks)
+        if 'error' in reply: raise ValueError(reply['error'])
+        return reply.get('networks') or []
+
+    def apply_networks(self, networks: list[dict]):
+        # Undo the previous network before the new identity is configured.
+        primary = next(network for network in networks if network['primary'])
+        if self.networks: remove_networks(self.interface, self.networks, self.server_address[0])
+        self.tun.addr, self.tun.netmask = primary['ip_address'], primary['subnet_mask']
+        if not self.networks: self.tun.persist(True), self.tun.up()
+        configure_networks(self.interface, networks, self.server_address[0])
         self.connection = primary['ip_address'], primary['subnet_mask']
-        return self.networks
+        self.networks = networks
+
+    def select_network(self, network_id: str) -> list[dict]:
+        reply = self.request(Control.connect, network_id=network_id)
+        if 'error' in reply: raise ValueError(reply['error'])
+        networks = Control.networks(reply.get('configuration'))
+        if self.tun: self.apply_networks(networks)
+        else: self.networks = networks
+        self.network_id, self.disconnected = network_id, False
+        return networks
+
+    def switch(self, network_id: str):
+        # Safe from another thread; the tunnel loop performs the change.
+        self.commands[0].send(network_id.encode())
 
     def new_tunnel(self, interface: str):
         try: import pytun
@@ -311,21 +821,42 @@ class VPNClient:
         flags = pytun.IFF_TUN | pytun.IFF_NO_PI
         return pytun.TunTapDevice(name=interface, flags=flags)
 
-    def connect(self, credentials: tuple, interface: str):
-        tun = self.new_tunnel(interface)
-        networks = self.authenticate(*credentials)
-        tun.addr, tun.netmask, tun.mtu = *self.connection, self.mtu
-        tun.persist(True), tun.up()
-        configure_networks(interface, networks)
+    def reconnect(self):
+        # A notice means the server changed this membership; read it again.
+        try: return self.select_network(self.network_id)
+        except ValueError: pass
+        # A deleted network gives way to the primary one the server chose.
+        default = next((network for network in self.list_networks() if network['default']), None)
+        if default:
+            try: return self.select_network(default['network_id'])
+            except ValueError: pass
+        remove_networks(self.interface, self.networks, self.server_address[0])
+        raise ConnectionError('The selected network is no longer available')
+
+    def connect(self, credentials: tuple, interface: str, network_id: str = None):
+        self.authenticate(*credentials)
+        networks = self.list_networks()
+        if not networks: raise ConnectionError('The account has no networks')
+        default = next((network for network in networks if network['default']), networks[0])
+        self.tun, self.interface = self.new_tunnel(interface), interface
+        self.tun.mtu = self.mtu
+        self.select_network(network_id or default['network_id'])
         self.speed_monitor.start_monitoring()
+        sources = [self.tun, self.socket_server, self.commands[1]]
         while True:
-            for source in select.select([tun, self.socket_server], [], [])[0]:
-                if type(source) == pytun.TunTapDevice:
+            for source in select.select(sources, [], [])[0]:
+                if source is self.tun:
                     packet = self.cipher.encrypt(source.read(source.mtu))
                     length = self.socket_server.sendto(packet, self.server_address)
                     self.speed_monitor.update_transfer(0, length)
-                    continue
-                try: packet = self.cipher.decrypt(source.recvfrom(65535)[0])
-                except (InvalidTag, ValueError): continue
-                if len(packet) > 0:
-                    self.speed_monitor.update_transfer(tun.write(packet), 0)
+                elif source is self.commands[1]:
+                    # A rejected switch keeps the current network active.
+                    try: self.select_network(source.recv(64).decode())
+                    except (ValueError, TimeoutError) as error: self.error = error
+                else:
+                    packet, address = source.recvfrom(65535)
+                    if address == self.server_address: self.receive(packet)
+                if self.kicked:
+                    remove_networks(self.interface, self.networks, self.server_address[0])
+                    raise ConnectionError('An administrator ended this session')
+                if self.disconnected: self.reconnect()

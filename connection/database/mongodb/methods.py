@@ -1,14 +1,3 @@
-def new_address(default_address: str, address_id: int):
-    ip_address = list(map(int, default_address.split('.')))
-    ip_address: list[int] = [*ip_address[:-1], address_id]
-    # Propagate address overflow toward the most significant octet.
-    for index in range(4)[::-1]:
-        value = ip_address[index]
-        ip_address[index] = value - 255 * (value // 255)
-        if index != 0: ip_address[index - 1] += value // 255
-    return '.'.join(str(n) for n in ip_address)
-
-
 def network_properties(network_range: tuple or str = None) -> tuple:
     if type(network_range) == tuple:
         # Derive the prefix size from the distance between endpoint octets.

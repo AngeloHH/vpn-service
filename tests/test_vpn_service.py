@@ -1,18 +1,30 @@
+import re
 import unittest
 
 import bcrypt
 from bson import ObjectId
 from scapy.layers.inet import IP
 from scapy.packet import Raw
+from tcp_sansio import TCPStack
 
 
 from connection.database.mongodb import Account, Network
-from connection.protocol import ClientHandshake
+from connection.protocol import ClientHandshake, Control, Protocol
+from connection.virtual_http import HTTPResponse
 from connection.vpn_service import VPNServer
 
 
 class InsertResult:
     def __init__(self, inserted_id): self.inserted_id = inserted_id
+
+
+def matches(document: dict, query: dict) -> bool:
+    # Equality, plus the $regex form the panel uses for case-insensitive emails.
+    def match(value, expected):
+        if type(expected) is not dict or '$regex' not in expected: return value == expected
+        flags = re.IGNORECASE if 'i' in expected.get('$options', '') else 0
+        return type(value) is str and re.search(expected['$regex'], value, flags) is not None
+    return all(match(document.get(key), value) for key, value in query.items())
 
 
 class Collection:
@@ -21,7 +33,7 @@ class Collection:
 
     def find_one(self, query):
         self.operations += 1
-        return next((document for document in self.documents if all(document.get(k) == v for k, v in query.items())), None)
+        return next((document for document in self.documents if matches(document, query)), None)
 
     def insert_one(self, document):
         self.operations += 1
@@ -36,9 +48,12 @@ class Collection:
             if not all(document.get(k) == v for k, v in query.items())
         ]
 
-    def update_one(self, query, update):
+    def update_one(self, query, update, upsert=False):
         self.operations += 1
         document = self.find_one(query)
+        if not document and upsert:
+            self.insert_one(dict(query))
+            document = self.documents[-1]
         if not document: return
         for key, value in update.get('$set', {}).items(): document[key] = value
         for key, value in update.get('$inc', {}).items(): document[key] = document.get(key, 0) + value
@@ -82,14 +97,35 @@ class VPNServiceTest(unittest.TestCase):
         server.server = Socket()
         return server, collections
 
-    def authenticate(self, server, address):
+    def login(self, server, address):
         client = ClientHandshake(server.public_key)
         server.receive_handshake((client.hello(), address))
         client.server_hello(server.server.packets.pop()[0])
         credentials = client.credentials('username', 'password123*')
         server.receive_handshake((credentials, address))
-        configuration = server.server.packets.pop()[0]
-        return client.configuration(configuration)[1]
+        return client.configuration(server.server.packets.pop()[0])
+
+    def control(self, server, cipher, address, request=None, **message):
+        if request is None: request = cipher.counter + 1
+        message = Control.pack(dict(request=request, **message))
+        server.receive_control((cipher.encrypt(message, Protocol.control), address))
+        reply = server.server.packets.pop()[0]
+        return Control.unpack(cipher.decrypt(reply, Protocol.control))
+
+    def authenticate(self, server, address):
+        cipher = self.login(server, address)
+        options = self.control(server, cipher, address, action='list')['networks']
+        network_id = next(option for option in options if option['default'])['network_id']
+        self.control(server, cipher, address, action='connect', network_id=network_id)
+        return cipher
+
+    def pump(self, server, cipher, address, stack):
+        for packet in stack.transmit():
+            server.send_packet((cipher.encrypt(packet), address))
+        while server.server.packets:
+            packet, destination = server.server.packets.pop(0)
+            self.assertEqual(destination, address)
+            stack.receive(cipher.decrypt(packet))
 
     def test_secure_session_routes_without_database_queries(self):
         server, collections = self.server()
@@ -98,7 +134,7 @@ class VPNServiceTest(unittest.TestCase):
         operations = sum(collection.operations for collection in collections.values())
         packet = bytes(IP(src='192.168.1.2', dst='192.168.1.2') / Raw(b'packet content'))
 
-        server.send_packet(False, (client.encrypt(packet), address))
+        server.send_packet((client.encrypt(packet), address))
         encrypted, destination = server.server.packets.pop()
 
         self.assertEqual(destination, address)
@@ -132,12 +168,56 @@ class VPNServiceTest(unittest.TestCase):
         )
         server = VPNServer(MongoClient(Database(collections)), 'database')
         server.server.close()
-        accesses = server.network_accesses(account.get())
+        accesses = server.network_accesses(account.get(), primary_id)
 
         self.assertEqual([access.ip_address for access in accesses],
                          ['10.10.0.2', '10.10.0.2'])
         routed = Network(networks, routed_id).get()
         self.assertEqual(routed['routes'][account_id.__str__()], '10.10.0.2')
+
+    def test_virtual_http_crosses_the_encrypted_udp_tunnel(self):
+        server, collections = self.server()
+        network_id = collections['networks'].documents[0]['_id']
+        http = server.add_virtual_http(network_id, '192.168.1.1')
+
+        @http.route('GET', '/')
+        def index(request):
+            return HTTPResponse('Virtual router')
+
+        address = '127.0.0.1', 50000
+        cipher = self.authenticate(server, address)
+        session = server.registry.get_session(cipher.session_id)
+        configuration = session.configurations()[0]['server']
+        self.assertEqual(configuration,
+                         dict(ip_address='192.168.1.1', port=80))
+        operations = sum(collection.operations
+                         for collection in collections.values())
+        stack = TCPStack('192.168.1.2', mtu=1420, seed=1)
+        connection = stack.connect('192.168.1.1', 80)
+
+        for _ in range(100):
+            self.pump(server, cipher, address, stack)
+            if connection.state == 'ESTABLISHED': break
+        self.assertEqual(connection.state, 'ESTABLISHED')
+
+        request = b'GET / HTTP/1.1\r\nHost: 192.168.1.1\r\nConnection: close\r\n\r\n'
+        self.assertEqual(connection.send(request[:20]), 20)
+        for _ in range(5): self.pump(server, cipher, address, stack)
+        self.assertEqual(connection.receive(), b'')
+        self.assertEqual(connection.send(request[20:]), len(request) - 20)
+        response = bytearray()
+        for _ in range(100):
+            self.pump(server, cipher, address, stack)
+            response.extend(connection.receive())
+            if connection.eof: break
+
+        self.assertIn(b'HTTP/1.1 200 OK\r\n', response)
+        self.assertTrue(response.endswith(b'\r\n\r\nVirtual router'))
+        self.assertTrue(connection.eof)
+        self.assertEqual(
+            sum(collection.operations for collection in collections.values()),
+            operations
+        )
 
 
 if __name__ == '__main__': unittest.main()

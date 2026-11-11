@@ -13,6 +13,7 @@ spec.loader.exec_module(protocol)
 
 ClientHandshake = protocol.ClientHandshake
 PacketCipher = protocol.PacketCipher
+Protocol = protocol.Protocol
 ServerHandshake = protocol.ServerHandshake
 
 
@@ -44,18 +45,26 @@ class ProtocolTest(unittest.TestCase):
     def test_configuration_creates_directional_ciphers(self):
         server, client, state = self.handshake()
         session_id = os.urandom(16)
-        networks = [dict(
-            network_id='65c64154b0f8142a7a9b4c31', mode='assigned',
-            ip_address='192.168.1.2', subnet_mask='255.255.255.0',
-            network_range='192.168.1.0/24', primary=True, routes=[]
-        )]
-        packet = server.configuration(state, networks, session_id)
-        configuration, client_cipher = client.configuration(packet)
+        packet = server.configuration(state, session_id)
+        client_cipher = client.configuration(packet)
         server_cipher = PacketCipher(session_id, state['keys']['server'], state['keys']['client'])
 
-        self.assertEqual(configuration, networks)
+        self.assertEqual(client_cipher.session_id, session_id)
         self.assertEqual(server_cipher.decrypt(client_cipher.encrypt(b'client packet')), b'client packet')
         self.assertEqual(client_cipher.decrypt(server_cipher.encrypt(b'server packet')), b'server packet')
+
+    def test_packet_type_is_authenticated(self):
+        server, client, state = self.handshake()
+        session_id = os.urandom(16)
+        client_cipher = PacketCipher(session_id, state['keys']['client'], state['keys']['server'], client=True)
+        server_cipher = PacketCipher(session_id, state['keys']['server'], state['keys']['client'])
+        packet = client_cipher.encrypt(b'{"request":1}', Protocol.control)
+
+        with self.assertRaises(ValueError): server_cipher.decrypt(packet)
+        forged = bytearray(packet)
+        forged[5] = Protocol.data
+        with self.assertRaises(InvalidTag): server_cipher.decrypt(bytes(forged))
+        self.assertEqual(server_cipher.decrypt(packet, Protocol.control), b'{"request":1}')
 
     def test_packets_have_unique_counters_and_tags(self):
         server, client, state = self.handshake()

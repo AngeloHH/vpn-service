@@ -1,30 +1,50 @@
+from ipaddress import ip_network
+from itertools import islice
+
 from bson import ObjectId
 from pymongo.collection import Collection
 
 from .accounts import Account
-from .methods import network_properties, new_address
+from .methods import network_properties
 from ..exceptions import AddressConflict
+
+
+def router_address(network_range: str) -> str:
+    # Every network has a panel; by default it takes the last usable host.
+    network = ip_network(network_range, strict=False)
+    if network.prefixlen >= 31: return network[-1].__str__()
+    return (network.broadcast_address - 1).__str__()
 
 
 class Network(Account):
     def __init__(self, collection: Collection, _id: str or ObjectId = None):
         super().__init__(collection, _id)
 
-    def create(self, network_range: str or tuple, max_address: int):
+    def create(self, network_range: str or tuple, max_address: int,
+               organization_id: ObjectId = None, name: str = None):
+        # The name is optional; the panel numbers unnamed networks.
         properties = network_properties(network_range)
         arguments = dict(subnet_mask=properties[1], network_range=properties[2])
-        arguments.update(max_address=max_address, connections={}, routes={})
+        server = dict(ip_address=router_address(properties[2]), port=80)
+        # A new network reaches only its own members until someone opens the internet.
+        arguments.update(max_address=max_address, connections={}, routes={},
+                         server=server, organization_id=organization_id, name=name,
+                         internet=False, dns=[], forwards=[])
         return super().create(**arguments)
 
     def _get_address(self):
-        network, address = self.get(), None
-        base_address = network['network_range'].split('/')[0]
-        used_addresses = list(network['connections'].values())
-        used_addresses += list(network['routes'].values())
-        for address_id in range(network['max_address']):
-            address = new_address(base_address, address_id)
-            if address not in used_addresses: break
-        return address
+        # Hosts exclude the network and broadcast addresses of the range.
+        network = self.get()
+        used = set(network['connections'].values())
+        used.update(network['routes'].values())
+        # Forwarding rules listen on addresses of their own.
+        used.update(forward['address'] for forward in network.get('forwards') or [])
+        server = network.get('server') or {}
+        if server.get('ip_address'): used.add(server['ip_address'])
+        hosts = ip_network(network['network_range'], strict=False).hosts()
+        for address in map(str, islice(hosts, network['max_address'])):
+            if address not in used: return address
+        raise AddressConflict().exhausted()
 
     def _source_network(self, networks: dict,
                         source_network: str or ObjectId = None):
@@ -59,18 +79,18 @@ class Network(Account):
 
     def _assigned_address(self, network: dict, account_id: str) -> str:
         # A local lease replaces any foreign route previously owned here.
-        arguments = account_id, self._get_address()
-        ip_address = network['connections'].get(*arguments)
-        address_list = list(network['connections'].items())
+        connections = network['connections']
+        ip_address = connections.get(account_id) or self._get_address()
+        address_list = list(connections.items())
         address_list += list(network['routes'].items())
         address_list = {value: key for key, value in address_list}
-        if account_id not in network['connections']:
-            network['connections'][account_id] = ip_address
+        if account_id not in connections:
+            connections[account_id] = ip_address
             if ip_address in address_list:
                 raise AddressConflict(ip_address).already_defined()
         routes = network['routes']
         routes.pop(account_id, None)
-        self.update(connections=network['connections'], routes=routes)
+        self.update(connections=connections, routes=routes)
         return ip_address
 
     def to_network(self, account: Account, mode: str = 'assigned',
@@ -81,7 +101,7 @@ class Network(Account):
         if mode == 'routed' and primary:
             raise ValueError('A routed network cannot be primary')
         network, account_details = self.get(), account.get()
-        networks, account_id = account_details['networks'], account.id.__str__()
+        networks, account_id = account_details.get('networks', {}), account.id.__str__()
         network_id, ip_address = self.id.__str__(), None
 
         if mode == 'routed':
@@ -92,11 +112,14 @@ class Network(Account):
             ip_address = self._assigned_address(network, account_id)
             access = dict(mode=mode, primary=primary)
 
-        # Exactly one assigned network may provide the reusable identity.
+        # Each organization keeps exactly one primary network per account.
         if primary:
-            for membership in networks.values():
+            organization_id = network.get('organization_id')
+            for other_id, membership in networks.items():
                 if type(membership) is not dict:
                     raise ValueError('Invalid network membership')
+                other = Network(self.collection, other_id).get() or {}
+                if other.get('organization_id') != organization_id: continue
                 membership.pop('primary', None)
         networks[network_id] = access
         account.update(networks=networks)

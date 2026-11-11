@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Panel del router</title>
+<link rel="stylesheet" href="/css/panel.css"></head>
+<body class="iso" data-theme="light">
+
+<!-- Pantalla de acceso -->
+<section class="rt-login" data-view="login">
+  <form class="rt-login-card" data-login autocomplete="off">
+    <span class="rt-corner" style="top:14px;left:16px" data-router-corner></span>
+    <h1 data-i18n="Administración del router">Administración del router</h1>
+    <p data-i18n="Ingrese la contraseña de su cuenta para continuar.">Ingrese la contraseña de su cuenta para continuar.</p>
+    <label for="rt-u" data-i18n="Usuario">Usuario</label>
+    <input class="rt-in" id="rt-u" name="u" value="" autocomplete="username" readonly>
+    <label for="rt-p" data-i18n="Contraseña">Contraseña</label>
+    <input class="rt-in" id="rt-p" name="p" type="password" autocomplete="current-password">
+    <button class="rt-btn" data-primary type="submit" data-i18n="Iniciar sesión">Iniciar sesión</button>
+    <div data-language-slot="login"></div>
+    <div class="rt-login-err" role="alert" data-login-err></div>
+  </form>
+</section>
+
+<!-- Aplicación -->
+<div data-view="app" hidden>
+  <header class="rt-top">
+    <div class="rt-brand">Router <small data-model></small></div>
+    <span class="rt-pill rt-hide-sm"><span class="rt-dot" data-wan-dot></span><span data-wan-pill>Internet</span></span>
+    <span class="rt-pill rt-hide-sm" data-mode-pill></span>
+    <span class="rt-gap"></span>
+    <span data-language-slot></span>
+    <button class="rt-btn" type="button" data-act="theme" aria-label="Cambiar tema" data-i18n="Tema" data-i18n-label="Cambiar tema">Tema</button>
+    <button class="rt-btn" type="button" data-act="logout" data-i18n="Salir">Salir</button>
+  </header>
+  <div class="rt-shell">
+    <nav class="rt-nav" aria-label="Secciones" data-i18n-label="Secciones" data-nav></nav>
+    <main class="rt-main" data-main tabindex="-1"></main>
+  </div>
+  <div class="rt-save" data-savebar role="region" aria-label="Cambios sin guardar" data-i18n-label="Cambios sin guardar">
+    <span data-i18n="Hay cambios sin guardar en esta sección.">Hay cambios sin guardar en esta sección.</span>
+    <button class="rt-btn" type="button" data-act="discard" data-i18n="Descartar">Descartar</button>
+    <button class="rt-btn" data-primary type="button" data-act="save" data-i18n="Guardar cambios">Guardar cambios</button>
+  </div>
+</div>
+<div class="rt-toasts" data-toasts role="status" aria-live="polite"></div>
+<div data-modal-host></div>
+
+<script src="/js/util.js"></script>
+<script src="/js/i18n.js"></script>
+<script src="/js/i18n/en.js"></script>
+<script src="/js/i18n/zh.js"></script>
+<script src="/js/i18n/ru.js"></script>
+<script src="/js/state.js"></script>
+<script src="/js/live.js"></script>
+<script src="/js/members.js"></script>
+<script src="/js/ports.js"></script>
+<script src="/js/views.js"></script>
+<script src="/js/actions.js"></script>
+<script src="/js/networks.js"></script>
+<script src="/js/limits.js"></script>
+<script src="/js/usage.js"></script>
+<script src="/js/roles.js"></script>
+<script src="/js/access.js"></script>
+<script src="/js/security.js"></script>
+<script src="/js/backup.js"></script>
+<script src="/js/diagnostics.js"></script>
+<script src="/js/app.js"></script>
+</body></html>

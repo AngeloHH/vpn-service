@@ -7,3 +7,6 @@ class AddressConflict(Exception):
         if self.ip_address:
             text = text.format(' ' + self.ip_address)
         return super().__init__(text.format('')) or self
+
+    def exhausted(self):
+        return super().__init__('The network has no free addresses.') or self
