@@ -16,7 +16,6 @@ const NETWORK_ERRORS = {
     last_network: () => t("La organización necesita al menos una red."),
     unknown_account: () => t("No existe una cuenta con ese correo."),
     already_assigned: () => t("Esa cuenta ya tiene IP en esta red."),
-    only_network: () => t("Es la única red de esa cuenta en la organización; no se puede quitar."),
     invalid_name: () => t("El nombre admite hasta 40 caracteres."),
     internet_disabled: () => t("El servidor no permite salida a internet: se habilita al arrancarlo con --internet."),
     invalid_dns: () => t("Escriba hasta dos direcciones IPv4 separadas por coma, por ejemplo 1.1.1.1, 8.8.8.8."),
@@ -324,10 +323,13 @@ document.addEventListener("click", (e) => {
         if (result.message) return result.message;
         done(t("{name} ahora tiene {ip}.", {name: row.username, ip: result.data.ip}));
     });
-    confirmBox(t("¿Quitar a {name} de esta red?", {name: esc(row.username)}), row.primary ? t("Es su red primaria: pasa a otra red que tenga en esta organización.") : t("Pierde su IP en esta red y se reconecta."), t("Quitar"), () => {
-        networkPost("/api/assignments/delete", {network_id: n.id, account_id: id}).then((result) => {
-            if (result.message) return toast(result.message, "bad");
-            done(t("{name} ya no está en esta red.", {name: row.username}));
-        });
+    const removeMember = (confirm) => networkPost("/api/assignments/delete", {network_id: n.id, account_id: id, confirm}).then((result) => {
+        // Its only network here: removing it takes the account out of the organization.
+        if (result.status === 409) return modal(t("{name} saldrá de la organización", {name: esc(row.username)}),
+            `<p style="margin:0;font-size:14px">${t("No tiene otra red en esta organización: se desconecta y pierde el acceso hasta que lo vuelvan a añadir.")}</p>`,
+            t("Quitar igual"), () => removeMember(true), {danger: true});
+        if (result.message) return toast(result.message, "bad");
+        done(result.data && result.data.left ? t("{name} salió de la organización.", {name: row.username}) : t("{name} ya no está en esta red.", {name: row.username}));
     });
+    confirmBox(t("¿Quitar a {name} de esta red?", {name: esc(row.username)}), row.primary ? t("Es su red primaria: pasa a otra red que tenga en esta organización.") : t("Pierde su IP en esta red y se reconecta."), t("Quitar"), () => removeMember(false));
 });

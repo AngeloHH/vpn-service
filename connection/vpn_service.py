@@ -302,8 +302,10 @@ class VPNServer:
 
     def complete_change(self, change: dict):
         # MongoDB already holds the change; live sessions and panels follow it.
-        for account_id in change.get('kick', []): self.kick(account_id)
-        for account_id in change.get('disconnect', []): self.disconnect(account_id)
+        # Only sessions inside this organization: a member may be connected to another one.
+        organization_id = change.get('organization_id')
+        for account_id in change.get('kick', []): self.kick(account_id, organization_id)
+        for account_id in change.get('disconnect', []): self.disconnect(account_id, organization_id)
         for account_id, network_id in change.get('reconnect', []): self.reconnect(account_id, network_id)
         if change.get('forwards'): self.forwarding.install(*change['forwards'])
         if change.get('firewall'): self.firewall.install(*change['firewall'])
@@ -430,18 +432,24 @@ class VPNServer:
             session.reply = self.control_reply(session, message)
         self.send_control(session, session.reply)
 
-    def disconnect(self, account_id: ObjectId or str):
-        # The login survives; only routes are released and the client told.
+    def connected_here(self, account_id, organization_id=None):
+        # The live session of an account, when it is inside that organization (any, without one).
         session = self.registry.get_account(ObjectId(account_id.__str__()))
+        if not session or organization_id is None: return session
+        return session if session.organization_id.__str__() == organization_id.__str__() else None
+
+    def disconnect(self, account_id: ObjectId or str, organization_id=None):
+        # The login survives; only routes are released and the client told.
+        session = self.connected_here(account_id, organization_id)
         if not session or not session.networks: return
         self.registry.clear_networks(session)
         collection = self.table_name['connections']
         collection.delete_many({'account_id': session.account_id})
         self.send_control(session, dict(action=Control.disconnected))
 
-    def kick(self, account_id: ObjectId or str):
+    def kick(self, account_id: ObjectId or str, organization_id=None):
         # The login ends here; the client is told not to reconnect by itself.
-        session = self.registry.get_account(ObjectId(account_id.__str__()))
+        session = self.connected_here(account_id, organization_id)
         if not session: return
         self.send_control(session, dict(action=Control.kicked))
         self.registry.remove_session(session.account_id)

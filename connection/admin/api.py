@@ -237,7 +237,7 @@ def register_api(http: VirtualHTTPServer, vpn_server, interval: float = 1,
             actor, organization, body.get('network_id'), body.get('account_id'), body.get('ip'),
             body.get('expected')),
         '/api/assignments/delete': lambda actor, organization, body: admin.remove(
-            actor, organization, body.get('network_id'), body.get('account_id')),
+            actor, organization, body.get('network_id'), body.get('account_id'), body.get('confirm') is True),
         # network_id null: the organization's internet limits.
         '/api/limits': lambda actor, organization, body: admin.set_limits(
             actor, organization, body.get('network_id'), body.get('limits')),
@@ -567,7 +567,7 @@ def register_api(http: VirtualHTTPServer, vpn_server, interval: float = 1,
             kind = 'member_blocked' if blocked else 'member_unblocked'
             vpn_server.events.record(organization_id, WARN, kind, username=message, by=session.username)
             # Written first, then the live session ends: the order we agreed on.
-            if blocked: vpn_server.kick(target_id)
+            if blocked: vpn_server.kick(target_id, organization_id)
             return json_response(None, 204)
 
         return Deferred(work, finish)

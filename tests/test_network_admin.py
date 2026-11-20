@@ -234,15 +234,29 @@ class NetworkAdminTest(Panel, unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.admin.remove(self.member, self.organization, self.network_id, self.owner)
 
+    def test_removing_the_only_network_takes_the_member_out_once_confirmed(self):
+        with self.assertRaises(Confirmation) as pending:
+            self.admin.remove(self.owner, self.organization, self.network_id, self.member)
+        self.assertEqual([account['username'] for account in pending.exception.accounts], ['member'])
+        self.assertIn(str(self.member), self.network(self.network_id)['connections'])
+
+        effects = self.admin.remove(self.owner, self.organization, self.network_id, self.member, confirm=True)
+        self.assertNotIn(str(self.member), self.network(self.network_id)['connections'])
+        self.assertEqual(self.account_networks(self.member), {})
+        members = Member(self.collections['members'])
+        self.assertIsNone(members.get(organization_id=self.organization, account_id=self.member))
+        self.assertEqual((effects['result'], effects['kick'], effects.get('disconnect')),
+                         (dict(left=True), [self.member], None))
+        self.assertTrue(effects['event']['left'])
+
     def test_removing_the_primary_network_moves_the_primary(self):
-        self.refused('only_network', self.admin.remove, self.owner, self.organization, self.network_id, self.member)
         office = self.create('10.1.0.0/24')
         self.organizations.join(self.member, self.organization, office)
         effects = self.admin.remove(self.owner, self.organization, self.network_id, self.member)
 
         self.assertNotIn(str(self.member), self.network(self.network_id)['connections'])
         self.assertEqual(self.account_networks(self.member), {str(office): dict(mode='assigned', primary=True)})
-        self.assertEqual(effects['disconnect'], [self.member])
+        self.assertEqual((effects['disconnect'], effects['result']), ([self.member], dict(left=False)))
 
 
 class NetworkAPITest(Panel, unittest.TestCase):
@@ -324,6 +338,29 @@ class NetworkAPITest(Panel, unittest.TestCase):
         self.assertEqual((status, [account['username'] for account in content['accounts']]), (409, ['guest']))
         body['confirm'] = True
         self.assertEqual(self.request(channel, 'POST', '/api/networks/delete', cookie, body)[0], 200)
+
+    def test_removing_the_only_network_asks_and_kicks_the_member(self):
+        channel, cookie = self.logged()
+        cipher = self.vpn('member', self.member_address)[0]
+        # A session in another organization is not this organization's to end.
+        self.server.kick(self.member, ObjectId())
+        self.server.disconnect(self.member, ObjectId())
+        self.assertIsNotNone(self.server.registry.get_account(self.member))
+        self.assertEqual(self.elsewhere, [])
+
+        body = dict(network_id=str(self.network_id), account_id=str(self.member))
+        status, _, content = self.request(channel, 'POST', '/api/assignments/delete', cookie, body)
+        self.assertEqual((status, [account['username'] for account in content['accounts']]), (409, ['member']))
+        self.assertIsNotNone(self.server.registry.get_account(self.member))
+
+        body['confirm'] = True
+        status, _, content = self.request(channel, 'POST', '/api/assignments/delete', cookie, body)
+        self.assertEqual((status, content), (200, dict(left=True)))
+        self.server.advance_bridges()
+        self.assertIsNone(self.server.registry.get_account(self.member))
+        notices = [Control.unpack(cipher.decrypt(packet, Protocol.control))['action']
+                   for destination, packet in self.elsewhere if destination == self.member_address]
+        self.assertEqual(notices, ['kicked'])
 
     def test_assignments_list_their_actions(self):
         self.organizations.grant(self.owner, self.organization, self.member,

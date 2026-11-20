@@ -420,18 +420,19 @@ class NetworkAdmin:
         return dict(result=dict(ip=ip_address), disconnect=[ObjectId(account_id)], event=event)
 
     @serialized
-    def remove(self, actor_id, organization_id, network_id, account_id) -> dict:
+    def remove(self, actor_id, organization_id, network_id, account_id, confirm: bool = False) -> dict:
         actor = self._allow(actor_id, organization_id, 'addresses:delete', network_id)
         network = self._network(organization_id, network_id)
         account_id = self._assigned(network, account_id)
         self.organizations._target(actor, organization_id, ObjectId(account_id))
         plan = self._detach(organization_id, network['_id'], account_id)
-        # Without another network the removal is refused, not turned into a departure.
-        if plan['leaves']: raise NetworkError('only_network')
+        # Without another network the account leaves the organization, once confirmed.
+        if plan['leaves'] and not confirm: raise Confirmation([self._describe(account_id)])
         self._apply_detach(organization_id, plan)
         event = dict(kind='address_removed', network_id=network['_id'],
-                     username=self._describe(account_id)['username'])
-        return dict(result=None, disconnect=[plan['account_id']], event=event)
+                     username=self._describe(account_id)['username'], left=plan['leaves'])
+        ended = 'kick' if plan['leaves'] else 'disconnect'
+        return {'result': dict(left=plan['leaves']), ended: [plan['account_id']], 'event': event}
 
     # ---------- Helpers ----------
 

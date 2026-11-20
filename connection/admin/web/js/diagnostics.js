@@ -29,7 +29,7 @@ function eventText(e) {
         network_deleted: () => t("{who} eliminó la red {name}; {moved} cambiaron de red y {left} salieron de la organización", {...v, name: e.name || e.network_range}),
         address_added: () => t("{who} dio la IP {ip} a {username} en {net}", v),
         address_changed: () => t("{who} cambió la IP de {username} a {ip} en {net}", v),
-        address_removed: () => t("{who} quitó a {username} de {net}", v),
+        address_removed: () => e.left ? t("{who} quitó a {username} de {net} y salió de la organización", v) : t("{who} quitó a {username} de {net}", v),
         internet_limit: () => t("{username} llegó al límite de conexiones a internet", v),
         limits_changed: () => e.scope === "internet" ? t("{who} cambió los límites de internet", v) : t("{who} cambió los límites de {net}", v),
         extra_granted: () => t("{who} dio un extra a {target} de {amount} {where}", {...v,
