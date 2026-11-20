@@ -97,6 +97,27 @@ python -m connection.desktop
 
 The server and username are remembered; the password never is.
 
+### One executable
+
+```
+pip install -r requirements-build.txt
+python build.py                        # dist/VPN (VPN.exe on Windows)
+python build.py --wintun C:\path\wintun.dll   # Windows, without internet
+```
+
+The same executable opens the window when it has no arguments and runs the
+commands when it has them (`VPN register ...`, `VPN connect ...`). Each system
+builds its own (Windows on Windows, macOS on macOS). On Windows it carries
+`wintun.dll` inside, and its manifest asks for no console of its own: on
+Windows 11 24H2 and later a double click opens only the window; older versions
+show a console for a moment, which the window hides. Opened with a double click
+it asks once for administrator rights; from a terminal the commands print and
+return their exit codes as usual (`connect` needs an administrator terminal). Without `--wintun`, Wintun 0.14.1 is downloaded from
+wintun.net, its Authenticode signature is checked and its SHA-256 is shown so it
+can be pinned with `--wintun-sha256`. With `--wintun`, the given `.dll` (or the
+Wintun `.zip`) is used as it is and nothing is downloaded; it must match the
+architecture being built.
+
 ## Multiple Network Access
 
 An account keeps one encrypted session even when it can access several networks.

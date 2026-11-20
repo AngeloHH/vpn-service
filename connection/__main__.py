@@ -1,11 +1,12 @@
 import argparse
 import os
+import sys
 from getpass import getpass
 from pathlib import Path
 
 from pymongo import MongoClient
 
-from connection import client_cli, srp
+from connection import client_cli, console, srp
 from connection.admin import register_admin
 from connection.database.mongodb import Account
 from connection.vpn_service import EMAIL, USERNAME, VPNServer, exactly
@@ -55,8 +56,19 @@ def add_account(options: argparse.Namespace, ask=getpass) -> str:
     return account['id']
 
 
+def window() -> int:
+    # No arguments: the desktop window, from the same executable as the commands.
+    console.hide_own_console()
+    if console.elevate([]): return 0
+    from connection.desktop.window import main as desktop
+    return desktop(sys.argv[:1])
+
+
 def main(arguments: list[str] = None):
-    parser = argparse.ArgumentParser(prog='python -m connection')
+    arguments = sys.argv[1:] if arguments is None else arguments
+    if not arguments: return window()
+    parser = argparse.ArgumentParser(prog='python -m connection',
+                                     description='Without arguments it opens the desktop window.')
     commands = parser.add_subparsers(dest='command', required=True)
     command = commands.add_parser('serve', help='run the VPN server')
     command.add_argument('--mongo', default='mongodb://localhost:27017/')
