@@ -385,6 +385,19 @@ class AccessTest(Panel, unittest.TestCase):
         self.assertFalse(self.server.registry.get_account(self.member).networks)
         self.server.reconnect(ObjectId(), self.other)
 
+    def test_members_of_the_target_network_reconnect_to_learn_the_route(self):
+        # Without it they would send packets for the routed address outside the tunnel.
+        witness = self.account('witness')
+        self.organizations.join(witness, self.organization, self.other)
+        self.vpn('witness', ('127.0.0.1', 53999), self.other)
+        self.assertTrue(self.server.registry.get_account(witness).networks)
+        self.route()
+        self.assertFalse(self.server.registry.get_account(witness).networks)
+        self.vpn('witness', ('127.0.0.1', 53999), self.other)
+        member = str(self.member)
+        self.apply(self.admin.remove_route(self.owner, self.organization, self.other, member))
+        self.assertFalse(self.server.registry.get_account(witness).networks)
+
     def test_a_route_needs_a_valid_source_and_a_member(self):
         self.route_refused('unknown_account', email='nobody@example.com')
         self.route_refused('unknown_account', email='')

@@ -79,8 +79,15 @@ class AccessAdmin:
         ip_address = Network(self.networks, network['_id']).to_network(
             Account(self.accounts, account['_id']), 'routed', source['_id'])
         event = dict(kind='route_added', network_id=network['_id'], username=account.get('username'), ip=ip_address)
-        # Only a session in that source network needs the new route.
-        return dict(result=dict(ip=ip_address), reconnect=[(account['_id'], source['_id'])], event=event)
+        # The member reconnects through its source network to receive this one, and the
+        # members connected through this network to receive the route to its address.
+        reconnect = [(account['_id'], source['_id'])] + self.connected_through(network)
+        return dict(result=dict(ip=ip_address), reconnect=reconnect, event=event)
+
+    @staticmethod
+    def connected_through(network: dict) -> list:
+        # Pairs for VPNServer.reconnect: only sessions whose primary is this network are renewed.
+        return [(ObjectId(account_id), network['_id']) for account_id in network.get('connections', {})]
 
     @serialized
     def remove_route(self, actor_id, organization_id, network_id, account_id) -> dict:
@@ -95,7 +102,8 @@ class AccessAdmin:
         self.admin._apply_detach(organization_id, plan)
         event = dict(kind='route_removed', network_id=network['_id'], username=account.get('username'))
         reconnect = [(ObjectId(account_id), ObjectId(source))] if source else []
-        return dict(result=None, reconnect=reconnect, event=event)
+        # The others in this network drop the route to that address.
+        return dict(result=None, reconnect=reconnect + self.connected_through(network), event=event)
 
     # ---------- Forwards ----------
 
