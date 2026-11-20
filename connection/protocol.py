@@ -3,18 +3,21 @@ import os
 import struct
 import time
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from connection import errors, srp
+
 
 class Protocol:
-    magic, version = b'SVPN', 1
+    magic, version = b'SVPN', 2
     client_hello, server_hello = 1, 2
     authentication, configuration = 3, 4
     data, error, control = 5, 6, 7
+    challenge, registered = 8, 9
     header = struct.Struct('!4sBB16s')
 
     @classmethod
@@ -106,7 +109,7 @@ class PacketCipher:
 
 
 class Handshake:
-    context = b'simple-vpn handshake version 1'
+    context = b'simple-vpn handshake version 2'
 
     @staticmethod
     def public_bytes(key) -> bytes:
@@ -123,7 +126,7 @@ class Handshake:
 
     @classmethod
     def keys(cls, shared_key: bytes, transcript: bytes) -> dict:
-        # Bind every derived key to the complete signed transcript.
+        # Bind every derived key to the complete transcript.
         algorithm = hashes.SHA256()
         digest = hashes.Hash(algorithm)
         digest.update(transcript)
@@ -155,119 +158,175 @@ class Handshake:
         return current_type, identifier, content
 
 
+def pack_fields(*fields: bytes) -> bytes:
+    # Each field carries its own length so none can bleed into the next.
+    return b''.join(struct.pack('!H', len(field)) + field for field in fields)
+
+
+def unpack_fields(content: bytes, count: int) -> list[bytes]:
+    fields = []
+    for _ in range(count):
+        if len(content) < 2: raise ValueError('Invalid authentication packet')
+        length, content = struct.unpack('!H', content[:2])[0], content[2:]
+        if len(content) < length: raise ValueError('Invalid authentication packet')
+        fields.append(content[:length])
+        content = content[length:]
+    if content: raise ValueError('Invalid authentication packet')
+    return fields
+
+
+class Steps:
+    # The first byte of an authentication packet says what the client asks.
+    register, login, proof = 1, 2, 3
+
+
 class ServerHandshake(Handshake):
-    def __init__(self, private_key: bytes or str = None):
-        if type(private_key) is str: private_key = bytes.fromhex(private_key)
-        identity = Ed25519PrivateKey
-        if private_key: self.identity = identity.from_private_bytes(private_key)
-        else: self.identity = identity.generate()
-        self.private_key = self.private_bytes(self.identity)
-        self.public_key = self.public_bytes(self.identity.public_key())
+    """The server side: an ephemeral exchange, then the password (SRP) decides.
+
+    There is no identity a client has to know beforehand. The ephemeral
+    exchange hides what travels; SRP proves both sides and its key is mixed
+    into the traffic keys, so someone in the middle can neither read nor finish.
+    """
+
+    def __init__(self, secret: bytes or str = None):
+        if type(secret) is str: secret = bytes.fromhex(secret)
+        # Only invents stable answers for unknown names; never leaves the server.
+        self.secret = secret or os.urandom(32)
 
     def hello(self, packet: bytes) -> tuple:
-        # Validate the client hello before creating an ephemeral secret.
         details = Protocol.unpack(packet, Protocol.client_hello)
         identifier, content = details[1:3]
         if len(content) != 32: raise ValueError('The client public key is invalid')
         client_key = X25519PublicKey.from_public_bytes(content)
         private_key = X25519PrivateKey.generate()
-        public_key = self.public_bytes(private_key.public_key())
-        # Sign both hello packets so the ephemeral exchange is authenticated.
-        content = public_key + self.public_key
-        unsigned = Protocol.pack(Protocol.server_hello, identifier, content)
-        reply = unsigned + self.identity.sign(packet + unsigned)
+        reply = Protocol.pack(Protocol.server_hello, identifier, self.public_bytes(private_key.public_key()))
         shared_key = private_key.exchange(client_key)
-        state = dict(identifier=identifier, created=time.monotonic())
-        state.update(keys=self.keys(shared_key, packet + reply), reply=reply)
+        state = dict(identifier=identifier, created=time.monotonic(), shared=shared_key,
+                     keys=self.keys(shared_key, packet + reply), reply=reply, transcript=packet + reply)
         return reply, state
 
-    def credentials(self, packet: bytes, state: dict) -> tuple:
-        # Credentials are accepted only inside the derived handshake channel.
-        key = state['keys']['client_handshake']
-        details = self.decrypt(key, packet, Protocol.authentication)
-        _, identifier, credentials = details
-        error = 'Invalid authentication packet'
-        invalid = identifier != state['identifier'] or len(credentials) < 3
-        if invalid: raise ValueError(error)
-        username_length, password_length = struct.unpack('!BH', credentials[:3])
-        username = credentials[3:3 + username_length]
-        password = credentials[3 + username_length:]
-        error = 'Invalid credentials length'
-        expected = username_length, password_length
-        received = len(username), len(password)
-        invalid = received != expected
-        if invalid: raise ValueError(error)
-        return username.decode(), password.decode()
+    def request(self, packet: bytes, state: dict) -> tuple:
+        # What the client asks, read inside the ephemeral channel.
+        details = self.decrypt(state['keys']['client_handshake'], packet, Protocol.authentication)
+        _, identifier, content = details
+        if identifier != state['identifier'] or not content: raise ValueError('Invalid authentication packet')
+        step, content = content[0], content[1:]
+        if step == Steps.register:
+            username, email, salt, verifier, iterations = unpack_fields(content, 5)
+            if len(iterations) != 4: raise ValueError('Invalid authentication packet')
+            return step, dict(username=username.decode(), email=email.decode(), srp=dict(
+                salt=salt.hex(), verifier=verifier.hex(), iterations=struct.unpack('!I', iterations)[0]))
+        if step == Steps.login:
+            username, public_a = unpack_fields(content, 2)
+            return step, dict(username=username.decode(), public=public_a)
+        if step == Steps.proof:
+            return step, dict(proof=unpack_fields(content, 1)[0])
+        raise ValueError('Invalid authentication packet')
 
-    def configuration(self, state: dict, session_id: bytes) -> bytes:
-        # Login only opens the session; networks are chosen through control.
-        arguments = state['keys']['server_handshake'], Protocol.configuration
-        arguments += state['identifier'], session_id
-        return self.encrypt(*arguments)
+    def reply(self, state: dict, packet_type: int, content: bytes = b'') -> bytes:
+        return self.encrypt(state['keys']['server_handshake'], packet_type, state['identifier'], content)
 
-    def error_packet(self, state: dict,
-                     message: str = 'Incorrect credentials') -> bytes:
-        arguments = state['keys']['server_handshake'], Protocol.error
-        arguments += state['identifier'], message.encode()
-        return self.encrypt(*arguments)
+    def challenge(self, state: dict, packet: bytes, username: str, record: dict, public_a: bytes) -> bytes:
+        # Unknown names receive an invented record and simply fail at the proof.
+        record = record if srp.valid(record) else srp.fake(self.secret, username)
+        salt = bytes.fromhex(record['salt'])
+        state['srp'] = srp.Server(username, salt, bytes.fromhex(record['verifier']), public_a)
+        content = pack_fields(salt, srp.GROUP.pad(state['srp'].public), struct.pack('!I', record['iterations']))
+        reply = self.reply(state, Protocol.challenge, content)
+        state['transcript'] += packet + reply
+        return reply
+
+    def finish(self, state: dict, packet: bytes, proof: bytes) -> dict or None:
+        # A wrong password ends here; a right one yields keys bound to everything seen.
+        answer = state['srp'].verify(proof)
+        if answer is None: return None
+        state['transcript'] += packet
+        keys = self.keys(state['shared'] + state['srp'].key, state['transcript'])
+        return dict(keys, answer=answer)
+
+    def configuration(self, state: dict, keys: dict, session_id: bytes) -> bytes:
+        # Only a client that saw the same exchange can open this packet.
+        return self.encrypt(keys['server_handshake'], Protocol.configuration, state['identifier'],
+                            keys['answer'] + session_id)
+
+    def error_packet(self, state: dict, code: str = 'incorrect_credentials', **details) -> bytes:
+        # A stable code: every client interface decides and translates by it.
+        return self.reply(state, Protocol.error, errors.encode(code, **details))
 
 
 class ClientHandshake(Handshake):
-    def __init__(self, server_key: bytes or str):
-        if type(server_key) is str: server_key = bytes.fromhex(server_key)
-        if not server_key: raise ValueError('The server public key is required')
-        self.server_key = Ed25519PublicKey.from_public_bytes(server_key)
+    def __init__(self):
         self.private_key, self.identifier = X25519PrivateKey.generate(), os.urandom(16)
         public_key = self.public_bytes(self.private_key.public_key())
-        self.keys = None
+        self.keys = self.shared = self.srp = None
         self.packet = Protocol.pack(Protocol.client_hello, self.identifier, public_key)
+        self.transcript = b''
 
     def hello(self) -> bytes:
         return self.packet
 
     def server_hello(self, packet: bytes):
-        # Verify the pinned identity before accepting ephemeral key material.
         details = Protocol.unpack(packet, Protocol.server_hello)
         identifier, content = details[1:3]
-        error = 'Invalid server handshake'
-        invalid = identifier != self.identifier or len(content) != 128
-        if invalid: raise ValueError(error)
-        public_key, identity, signature = content[:32], content[32:64], content[64:]
-        expected_key = self.public_bytes(self.server_key)
-        error = 'The server identity does not match'
-        if identity != expected_key: raise ValueError(error)
-        self.server_key.verify(signature, self.packet + packet[:-64])
-        # Derive the same directional keys from the verified transcript.
-        server_key = X25519PublicKey.from_public_bytes(public_key)
-        shared_key = self.private_key.exchange(server_key)
-        self.keys = Handshake.keys(shared_key, self.packet + packet)
+        if identifier != self.identifier or len(content) != 32: raise ValueError('Invalid server handshake')
+        self.shared = self.private_key.exchange(X25519PublicKey.from_public_bytes(content))
+        self.keys = Handshake.keys(self.shared, self.packet + packet)
+        self.transcript = self.packet + packet
 
-    def credentials(self, username: str, password: str) -> bytes:
-        username, password = username.encode(), password.encode()
-        error = 'The credentials are too long'
-        invalid = len(username) > 255 or len(password) > 65535
-        if invalid: raise ValueError(error)
-        header = struct.pack('!BH', len(username), len(password))
-        credentials = header + username + password
-        arguments = self.keys['client_handshake'], Protocol.authentication
-        arguments += self.identifier, credentials
-        return self.encrypt(*arguments)
+    def request(self, step: int, content: bytes) -> bytes:
+        arguments = self.keys['client_handshake'], Protocol.authentication, self.identifier
+        return self.encrypt(*arguments, bytes([step]) + content)
+
+    def answer(self, packet: bytes, expected: int) -> bytes:
+        # Errors arrive in the same channel; anything else is refused.
+        packet_type, identifier, content = self.decrypt(self.keys['server_handshake'], packet)
+        if identifier != self.identifier: raise ValueError('Invalid server handshake')
+        if packet_type == Protocol.error: raise errors.VPNError.from_bytes(content)
+        if packet_type != expected: raise ValueError('Invalid server handshake')
+        return content
+
+    def register(self, username: str, email: str, password: str, iterations: int = None) -> bytes:
+        # The password never leaves: only its verifier, computed here.
+        record = srp.verifier(password, iterations=iterations)
+        fields = (username.encode(), email.encode(), bytes.fromhex(record['salt']),
+                  bytes.fromhex(record['verifier']), struct.pack('!I', record['iterations']))
+        if any(len(field) > 1024 for field in fields): raise ValueError('The account details are too long')
+        return self.request(Steps.register, pack_fields(*fields))
+
+    def registered(self, packet: bytes):
+        self.answer(packet, Protocol.registered)
+
+    def login(self, username: str, password: str) -> bytes:
+        if len(username.encode()) > 1024: raise ValueError('The username is too long')
+        self.srp = srp.Client(username, password)
+        self.login_packet = self.request(Steps.login, pack_fields(username.encode(), srp.GROUP.pad(self.srp.public)))
+        return self.login_packet
+
+    def challenge(self, packet: bytes) -> bytes:
+        salt, public_b, iterations = unpack_fields(self.answer(packet, Protocol.challenge), 3)
+        if len(iterations) != 4: raise ValueError('Invalid server handshake')
+        proof = self.srp.challenge(salt, public_b, struct.unpack('!I', iterations)[0])
+        packet_proof = self.request(Steps.proof, pack_fields(proof))
+        self.transcript += self.login_packet + packet + packet_proof
+        return packet_proof
 
     def configuration(self, packet: bytes) -> PacketCipher:
-        details = self.decrypt(self.keys['server_handshake'], packet)
-        packet_type, identifier, content = details
-        if identifier != self.identifier: raise ValueError('Invalid configuration packet')
-        if packet_type == Protocol.error: raise ValueError(content.decode())
-        error = 'Invalid configuration packet'
-        invalid = packet_type != Protocol.configuration or len(content) != 16
-        if invalid: raise ValueError(error)
-        arguments = content, self.keys['client'], self.keys['server']
-        return PacketCipher(*arguments, client=True)
+        # A wrong password comes back as an error in the ephemeral channel.
+        details = Protocol.unpack(packet)
+        if details[0] == Protocol.error: self.answer(packet, Protocol.configuration)
+        keys = Handshake.keys(self.shared + self.srp.key, self.transcript)
+        try: packet_type, identifier, content = self.decrypt(keys['server_handshake'], packet)
+        except (InvalidTag, ValueError): raise ValueError('The server could not prove the password')
+        valid = identifier == self.identifier and packet_type == Protocol.configuration and len(content) == 48
+        # The server proves it holds the verifier: someone in the middle cannot.
+        if not valid or not self.srp.verify(content[:32]): raise ValueError('The server could not prove the password')
+        return PacketCipher(content[32:], keys['client'], keys['server'], client=True)
 
 
 class Control:
     # Control messages share the session cipher but never reach the TUN.
     list_networks, connect, disconnected = 'list', 'connect', 'disconnected'
+    create_organization, account = 'create_organization', 'account'
     # Unlike disconnected, kicked ends the login: the client must not reconnect.
     kicked = 'kicked'
     required = {'network_id', 'mode', 'ip_address', 'subnet_mask',

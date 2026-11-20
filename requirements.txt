@@ -1,5 +1,4 @@
 pymongo>=4.5.0,<5
-bcrypt>=4.0.1,<6
 cryptography>=41.0.3,<51
 scapy>=2.5.0,<3
 psutil>=5.9.0,<8

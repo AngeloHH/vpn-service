@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 from collections import deque
 import select
 import socket
@@ -9,14 +10,16 @@ from ipaddress import ip_address as parse_address, ip_network
 from threading import Lock, Thread
 from typing import Optional
 
-import bcrypt
 from bson import ObjectId
 from cryptography.exceptions import InvalidTag
 from pymongo import MongoClient
 from scapy.layers.inet import IP
 
 from connection import __version__
+from connection import srp
 from connection.admin.auth import WebSessions
+from connection.attempts import Attempts
+from connection.errors import VPNError, describe
 from connection.database.mongodb import Account, Connection, Member, Network, Organization
 from connection.database.mongodb.networks import router_address
 from connection.monitor import SpeedMonitor
@@ -33,7 +36,7 @@ from connection.access_admin import AccessAdmin
 from connection.security_admin import SecurityAdmin
 from connection.backup_admin import BackupAdmin
 from connection.protocol import (ClientHandshake, Control, PacketCipher,
-                                 Protocol, ServerHandshake)
+                                 Protocol, ServerHandshake, Steps)
 from connection.session import NetworkAccess, Session, SessionRegistry
 from connection.system import MODEL, ProcessMetrics
 from connection.tcp_bridge import VirtualHTTPBridge
@@ -41,11 +44,20 @@ from connection.utils import configure_networks, remove_networks
 from connection.virtual_http import VirtualHTTPServer
 
 logger = logging.getLogger(__name__)
+USERNAME = re.compile(r'[A-Za-z0-9._-]{3,32}')
+EMAIL = re.compile(r'[^@\s]{1,64}@[^@\s]+\.[^@\s]+')
+# How many organizations one account may administer.
+ORGANIZATIONS = 3
+
+
+def exactly(text: str) -> dict:
+    # The whole text, ignoring upper and lower case.
+    return {'$regex': '^' + re.escape(text) + '$', '$options': 'i'}
 
 
 class VPNServer:
     def __init__(self, mongo_client: MongoClient, table_name: str,
-                 private_key: bytes or str = None, public: bool = False,
+                 secret: bytes or str = None, public: bool = False,
                  internet: bool = False):
         self.table_name = mongo_client[table_name]
         # The server's own switch: without it no network can reach the internet.
@@ -62,11 +74,10 @@ class VPNServer:
         self.waker[1].setblocking(False)
         self.ip_address = '0.0.0.0'
         self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Keep a stable server identity around every ephemeral handshake.
-        self.handshake = ServerHandshake(private_key)
-        self.public_key = self.handshake.public_key.hex()
-        self.max_handshakes = 1024
-        self.private_key = self.handshake.private_key.hex()
+        # Clients know nothing beforehand: the password authenticates both sides.
+        self.handshake = ServerHandshake(secret)
+        self.secret = self.handshake.secret.hex()
+        self.max_handshakes, self.attempts = 1024, Attempts()
         # Sessions and routes are the in-memory packet data plane.
         self.events = Events()
         self.usage = Usage(lambda: self.table_name['usage'])
@@ -86,14 +97,24 @@ class VPNServer:
         # Transfer counters defer database writes beyond the packet path.
         self.transferred, self.transfer_lock = {}, Lock()
 
-    def authenticate(self, credentials: tuple[str, str]):
-        username, password = credentials
-        collection = self.table_name['accounts']
-        account = Account(collection).get(username=username)
-        if not account: return None
-        password_hash = account['password'].encode()
-        is_correct = bcrypt.checkpw(password.encode(), password_hash)
-        return account if is_correct else None
+    def find_account(self, username: str):
+        if not USERNAME.fullmatch(username): return None
+        return self.table_name['accounts'].find_one(dict(username=exactly(username)))
+
+    def register(self, fields: dict, address: tuple) -> str or None:
+        # Only a public server lets anyone in; the answer is an error code or None.
+        # The new account has no networks yet: it founds an organization or waits to be added.
+        if not self.public: return 'registration_closed'
+        username, email = fields['username'], fields['email'].strip()
+        if not USERNAME.fullmatch(username): return 'invalid_username'
+        if len(email) > 254 or not EMAIL.fullmatch(email): return 'invalid_email'
+        if not srp.valid(fields['srp']): return 'invalid_account'
+        accounts = self.table_name['accounts']
+        if accounts.find_one(dict(username=exactly(username))): return 'username_taken'
+        if accounts.find_one(dict(email=exactly(email))): return 'email_taken'
+        if not self.attempts.may_register(address[0]): return 'too_many_registrations'
+        Account(accounts).create(username=username, email=email, srp=fields['srp'], networks={})
+        return None
 
     def update_transfer(self, account_id: ObjectId or str, length: int):
         account_id = account_id.__str__()
@@ -168,7 +189,7 @@ class VPNServer:
 
     def network_options(self, account: dict) -> list[dict]:
         # The menu identifies choices; addresses are only applied from connect.
-        records, options = self._network_records(account) or [], []
+        records, options, names = self._network_records(account) or [], [], {}
         account_id = account['_id'].__str__()
         for network, details, membership, mode in records:
             if mode != NetworkAccess.assigned: continue
@@ -177,11 +198,16 @@ class VPNServer:
                       if record[2].get('source').__str__() == network_id]
             ip_address = details.get('connections', {}).get(account_id)
             organization_id = details.get('organization_id')
+            # Names let an interface show more than ranges; each organization is read once.
+            if organization_id and organization_id not in names:
+                organization = self.table_name['organizations'].find_one({'_id': organization_id}) or {}
+                names[organization_id] = organization.get('name')
             options.append(dict(
                 network_id=network_id, network_range=details['network_range'],
                 ip_address=ip_address, routed=routed,
                 default=bool(membership.get('primary')),
-                organization_id=organization_id and organization_id.__str__()
+                organization_id=organization_id and organization_id.__str__(),
+                name=details.get('name'), organization=names.get(organization_id)
             ))
         return options
 
@@ -299,6 +325,27 @@ class VPNServer:
             self.forwarding.install(organization_id, self.access_admin.table(organization_id))
             self.firewall.install(organization_id, self.security_admin.table(organization_id))
 
+    def create_organization(self, session: Session, name) -> dict:
+        # Anyone with an account may found an organization and administer it.
+        name = name.strip() if type(name) is str else ''
+        if not 1 <= len(name) <= 40: return describe('invalid_name')
+        administered = 0
+        for member in self.organizations.members.find(dict(account_id=session.account_id)):
+            role = member.get('role_id') and self.organizations.roles.find_one({'_id': member['role_id']})
+            administered += bool(role and role.get('administrator'))
+        if administered >= ORGANIZATIONS: return describe('organization_limit', limit=ORGANIZATIONS)
+        organization_id, network_id = self.found(session.account_id, name)
+        return dict(organization_id=organization_id.__str__(), network_id=network_id.__str__())
+
+    def found(self, account_id, name: str) -> tuple:
+        # The organization starts with its administrator, a first network and that network's panel.
+        organization_id = self.organizations.create(account_id, name)
+        network = self.table_name['networks'].find_one(dict(organization_id=organization_id))
+        self.add_panel(network['_id'])
+        self.forwarding.install(organization_id, self.access_admin.table(organization_id))
+        self.firewall.install(organization_id, self.security_admin.table(organization_id))
+        return organization_id, network['_id']
+
     def refresh_member(self, organization_id, account_id):
         # A new role or new permissions reach the open session without reconnecting it.
         session = self.registry.get_account(ObjectId(account_id.__str__()))
@@ -307,10 +354,8 @@ class VPNServer:
         except PermissionError: session.permissions = None
         self.apply_limits(session, session.limited_network)
 
-    def new_connection(self, credentials: tuple, address: tuple, keys: dict):
+    def open_session(self, account: dict, address: tuple, keys: dict) -> Session:
         # A login only opens the session; it gains routes on connect.
-        account = self.authenticate(credentials)
-        if not account: return None
         session_id = os.urandom(16)
         cipher = PacketCipher(session_id, keys['server'], keys['client'])
         session = Session(account['_id'], address, cipher)
@@ -322,12 +367,12 @@ class VPNServer:
         # Read the configuration now, so a stale menu never assigns an address.
         valid = type(network_id) is str and ObjectId.is_valid(network_id)
         networks = self.network_accesses(account, network_id) if valid else None
-        if not networks: return dict(error='The network is not available')
+        if not networks: return describe('network_unavailable')
         blocked = networks[0].organization_id and self.organizations.is_blocked(
             session.account_id, networks[0].organization_id)
-        if blocked: return dict(error='The account is blocked in this organization')
+        if blocked: return describe('account_blocked')
         try: self.registry.set_networks(session, networks)
-        except ValueError as error: return dict(error=str(error))
+        except ValueError as error: return dict(describe('network_conflict'), message=str(error))
         # Panel permissions are cached so HTTP requests never query MongoDB.
         organization_id, session.permissions = networks[0].organization_id, None
         session.organization_id, session.connected_at = organization_id, time.monotonic()
@@ -350,12 +395,16 @@ class VPNServer:
     def control_reply(self, session: Session, message: dict) -> dict:
         action, reply = message.get('action'), dict(request=message['request'])
         account = Account(self.table_name['accounts'], session.account_id).get()
-        if not account: reply.update(error='The account does not exist')
+        if not account: reply.update(describe('account_missing'))
         elif action == Control.list_networks:
             reply.update(networks=self.network_options(account))
         elif action == Control.connect:
             reply.update(self.activate(session, account, message.get('network_id')))
-        else: reply.update(error='Unknown control action')
+        elif action == Control.create_organization:
+            reply.update(self.create_organization(session, message.get('name')))
+        elif action == Control.account:
+            reply.update(username=account.get('username'), email=account.get('email'))
+        else: reply.update(describe('unknown_action'))
         return reply
 
     def send_control(self, session: Session, message: dict):
@@ -411,6 +460,7 @@ class VPNServer:
         for key, state in list(self.handshakes.items()):
             if current_time - state['created'] <= 15: continue
             self.handshakes.pop(key, None)
+        self.attempts.cleanup()
 
     def receive_hello(self, packet: bytes, address: tuple,
                       key: tuple, state: dict = None):
@@ -425,22 +475,45 @@ class VPNServer:
         self.handshakes[key] = state
         self.server.sendto(reply, address)
 
-    def receive_credentials(self, packet: bytes, address: tuple,
-                            state: dict):
-        if state.get('configuration'):
-            self.server.sendto(state['configuration'], address)
+    def receive_authentication(self, packet: bytes, address: tuple, state: dict):
+        # A repeated packet gets the same answer: UDP loss never repeats an action.
+        replies = state.setdefault('replies', {})
+        if packet in replies:
+            self.server.sendto(replies[packet], address)
             return
-        # Credentials and configuration travel inside the handshake cipher.
-        try: credentials = self.handshake.credentials(packet, state)
+        if len(replies) >= 4: return
+        try: step, fields = self.handshake.request(packet, state)
         except (InvalidTag, UnicodeDecodeError, ValueError): return
-        session = self.new_connection(credentials, address, state['keys'])
-        if session:
-            arguments = state, session.cipher.session_id
-            reply = self.handshake.configuration(*arguments)
-        else: reply = self.handshake.error_packet(state)
-        # Cache this encrypted reply so repeated UDP requests are harmless.
-        state['configuration'] = reply
+        reply = self.authentication_reply(step, fields, packet, address, state)
+        if reply is None: return
+        replies[packet] = reply
         self.server.sendto(reply, address)
+
+    def authentication_reply(self, step: int, fields: dict, packet: bytes, address: tuple, state: dict):
+        handshake = self.handshake
+        if step == Steps.register:
+            if state.get('srp'): return None
+            error = self.register(fields, address)
+            if error: return handshake.error_packet(state, error)
+            return handshake.reply(state, Protocol.registered)
+        if step == Steps.login:
+            if state.get('srp'): return None
+            username = fields['username']
+            state['tries'] = (('name', username.casefold()), ('address', address[0]))
+            wait = self.attempts.blocked(state['tries'])
+            if wait: return handshake.error_packet(state, 'too_many_attempts', wait=int(wait) + 1)
+            state['account'] = account = self.find_account(username)
+            try: return handshake.challenge(state, packet, username, (account or {}).get('srp'), fields['public'])
+            except ValueError: return None
+        if step != Steps.proof or not state.get('srp') or state.get('finished'): return None
+        state['finished'] = True
+        keys = handshake.finish(state, packet, fields['proof'])
+        if not keys or not state['account']:
+            self.attempts.failed(state['tries'])
+            return handshake.error_packet(state)
+        self.attempts.succeeded(state['tries'])
+        session = self.open_session(state['account'], address, keys)
+        return handshake.configuration(state, keys, session.cipher.session_id)
 
     def receive_handshake(self, connection: tuple[bytes, any]):
         packet, address = connection
@@ -452,7 +525,7 @@ class VPNServer:
         if packet_type == Protocol.client_hello:
             self.receive_hello(packet, address, key, state)
         elif packet_type == Protocol.authentication and state:
-            self.receive_credentials(packet, address, state)
+            self.receive_authentication(packet, address, state)
 
     def get_destination(self, session: Session, packet: bytes):
         packet = IP(packet)
@@ -654,7 +727,7 @@ class VPNServer:
                 if network.organization_id != organization_id: continue
                 key = network.network_id.__str__()
                 online[key] = online.get(key, 0) + 1
-        serial = hashlib.sha256(self.handshake.public_key).hexdigest()[:10].upper()
+        serial = hashlib.sha256(b'serial:' + self.handshake.secret).hexdigest()[:10].upper()
         return dict(
             model=MODEL, firmware=__version__, serial=serial,
             mode='public' if self.public else 'local',
@@ -705,9 +778,8 @@ class VPNServer:
 
 
 class VPNClient:
-    def __init__(self, server_address: Optional[tuple or str] = '192.168.1.0:5732',
-                 server_key: bytes or str = None):
-        self.server_address, self.server_key = server_address, server_key
+    def __init__(self, server_address: Optional[tuple or str] = '192.168.1.0:5732'):
+        self.server_address = server_address
         self.speed_monitor = SpeedMonitor()
         if type(self.server_address) == str:
             self.server_address = server_address.split(':')
@@ -736,15 +808,31 @@ class VPNClient:
                 except socket.timeout: continue
                 if address == self.server_address: return response
         finally: self.socket_server.settimeout(previous_timeout)
-        raise TimeoutError('The server did not complete the handshake')
+        raise VPNError('server_unreachable')
+
+    def handshake(self) -> ClientHandshake:
+        handshake = ClientHandshake()
+        handshake.server_hello(self.exchange(handshake.hello()))
+        return handshake
+
+    # Code, a CLI and a visual interface use these same calls; every failure
+    # they must handle is a VPNError with a stable code (connection.errors).
+
+    def register(self, username: str, email: str, password: str):
+        # Creates the account without networks; the password never leaves this computer.
+        try:
+            handshake = self.handshake()
+            handshake.registered(self.exchange(handshake.register(username, email, password)))
+        except ValueError: raise VPNError('invalid_server') from None
 
     def authenticate(self, username: str, password: str) -> PacketCipher:
-        # Verify server identity before placing credentials on the wire.
-        handshake = ClientHandshake(self.server_key)
-        packet = self.exchange(handshake.hello())
-        handshake.server_hello(packet)
-        packet = self.exchange(handshake.credentials(username, password))
-        self.cipher, self.request_id = handshake.configuration(packet), 0
+        # The password proves both sides; a wrong one or an impostor fails here.
+        try:
+            handshake = self.handshake()
+            login = handshake.login(username, password)
+            packet = self.exchange(handshake.challenge(self.exchange(login)))
+            self.cipher, self.request_id = handshake.configuration(packet), 0
+        except ValueError: raise VPNError('invalid_server') from None
         return self.cipher
 
     def receive(self, packet: bytes):
@@ -783,12 +871,28 @@ class VPNClient:
                     reply = self.receive(response)
                     if reply and reply.get('request') == self.request_id: return reply
         finally: self.socket_server.settimeout(previous_timeout)
-        raise TimeoutError('The server did not answer the control request')
+        raise VPNError('server_unreachable')
+
+    def ask(self, action: str, **fields) -> dict:
+        # A control request whose refusal becomes a VPNError with the server's code.
+        if not self.cipher: raise VPNError('not_authenticated')
+        reply = self.request(action, **fields)
+        if 'error' in reply: raise VPNError.from_reply(reply)
+        return reply
+
+    def create_organization(self, name: str) -> dict:
+        # After authenticate: the account founds an organization with a first network.
+        reply = self.ask(Control.create_organization, name=name)
+        return dict(organization_id=reply['organization_id'], network_id=reply['network_id'])
+
+    def account(self) -> dict:
+        # Who is logged in: an interface shows it, and the email others add it by.
+        reply = self.ask(Control.account)
+        return dict(username=reply.get('username'), email=reply.get('email'))
 
     def list_networks(self) -> list[dict]:
-        reply = self.request(Control.list_networks)
-        if 'error' in reply: raise ValueError(reply['error'])
-        return reply.get('networks') or []
+        # An empty list is not an error: the account waits or founds an organization.
+        return self.ask(Control.list_networks).get('networks') or []
 
     def apply_networks(self, networks: list[dict]):
         # Undo the previous network before the new identity is configured.
@@ -801,8 +905,7 @@ class VPNClient:
         self.networks = networks
 
     def select_network(self, network_id: str) -> list[dict]:
-        reply = self.request(Control.connect, network_id=network_id)
-        if 'error' in reply: raise ValueError(reply['error'])
+        reply = self.ask(Control.connect, network_id=network_id)
         networks = Control.networks(reply.get('configuration'))
         if self.tun: self.apply_networks(networks)
         else: self.networks = networks
@@ -815,28 +918,29 @@ class VPNClient:
 
     def new_tunnel(self, interface: str):
         try: import pytun
-        except ImportError:
-            message = 'A TUN driver is required to connect the VPN client'
-            raise RuntimeError(message)
+        except ImportError: raise VPNError('tun_missing') from None
         flags = pytun.IFF_TUN | pytun.IFF_NO_PI
         return pytun.TunTapDevice(name=interface, flags=flags)
 
     def reconnect(self):
         # A notice means the server changed this membership; read it again.
         try: return self.select_network(self.network_id)
-        except ValueError: pass
+        except VPNError as error:
+            if error.code == 'server_unreachable': raise
         # A deleted network gives way to the primary one the server chose.
         default = next((network for network in self.list_networks() if network['default']), None)
         if default:
             try: return self.select_network(default['network_id'])
-            except ValueError: pass
+            except VPNError as error:
+                if error.code == 'server_unreachable': raise
         remove_networks(self.interface, self.networks, self.server_address[0])
-        raise ConnectionError('The selected network is no longer available')
+        raise VPNError('network_lost')
 
-    def connect(self, credentials: tuple, interface: str, network_id: str = None):
-        self.authenticate(*credentials)
+    def connect(self, credentials: tuple = None, interface: str = 'vpn0', network_id: str = None):
+        # Without credentials it reuses the session opened by authenticate.
+        if credentials: self.authenticate(*credentials)
         networks = self.list_networks()
-        if not networks: raise ConnectionError('The account has no networks')
+        if not networks: raise VPNError('no_networks')
         default = next((network for network in networks if network['default']), networks[0])
         self.tun, self.interface = self.new_tunnel(interface), interface
         self.tun.mtu = self.mtu
@@ -852,11 +956,11 @@ class VPNClient:
                 elif source is self.commands[1]:
                     # A rejected switch keeps the current network active.
                     try: self.select_network(source.recv(64).decode())
-                    except (ValueError, TimeoutError) as error: self.error = error
+                    except (UnicodeDecodeError, VPNError) as error: self.error = error
                 else:
                     packet, address = source.recvfrom(65535)
                     if address == self.server_address: self.receive(packet)
                 if self.kicked:
                     remove_networks(self.interface, self.networks, self.server_address[0])
-                    raise ConnectionError('An administrator ended this session')
+                    raise VPNError('session_ended')
                 if self.disconnected: self.reconnect()

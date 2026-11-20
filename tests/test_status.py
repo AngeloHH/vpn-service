@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import bcrypt
 from bson import ObjectId
 from tcp_sansio import TCPStack
 
@@ -16,7 +15,6 @@ from connection import __main__ as cli, system
 from connection.admin import register_admin
 from connection.organizations import Organizations
 from connection.permissions import Permissions
-from connection.protocol import ClientHandshake
 from connection.vpn_service import VPNServer
 from tests import test_vpn_service as tunnel
 from tests.test_organizations import Collection
@@ -151,9 +149,9 @@ class ServeTest(unittest.TestCase):
 
     def test_the_key_is_created_once_and_reused(self):
         first = self.run_cli()
-        self.assertEqual(self.key.read_text(), first.private_key)
+        self.assertEqual(self.key.read_text(), first.secret)
         if os.name == 'posix': self.assertEqual(self.key.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.run_cli().public_key, first.public_key)
+        self.assertEqual(self.run_cli().secret, first.secret)
 
     def test_the_mode_is_chosen_from_the_command_line(self):
         self.assertFalse(self.run_cli().public)

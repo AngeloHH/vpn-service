@@ -2,7 +2,6 @@ import socket
 import unittest
 from unittest import mock
 
-import bcrypt
 from bson import ObjectId
 from scapy.layers.inet import IP
 from scapy.packet import Raw
@@ -11,6 +10,7 @@ from connection import utils
 from connection.database.mongodb import Account, Network
 from connection.protocol import Control, Protocol
 from connection.vpn_service import VPNClient, VPNServer
+from tests import RECORD
 from tests import test_vpn_service as tunnel
 
 
@@ -41,10 +41,9 @@ class ControlTest(unittest.TestCase):
     def setUp(self):
         self.account_id = ObjectId()
         self.network_a, self.network_b, self.routed = ObjectId(), ObjectId(), ObjectId()
-        password = bcrypt.hashpw(b'password123*', bcrypt.gensalt(4)).decode()
         accounts = tunnel.Collection([dict(
             _id=self.account_id, username='username',
-            password=password, networks={}
+            srp=RECORD, networks={}
         )])
         network = lambda _id, network_range: dict(
             _id=_id, subnet_mask='255.255.255.0', network_range=network_range,
@@ -127,7 +126,7 @@ class ControlTest(unittest.TestCase):
         self.connect(cipher, self.network_a)
         for network_id in (ObjectId(), 'invalid'):
             reply = self.connect(cipher, network_id)
-            self.assertEqual(reply['error'], 'The network is not available')
+            self.assertEqual((reply['error'], reply['message']), ('network_unavailable', 'The network is not available'))
         session = self.server.registry.get_session(cipher.session_id)
         self.assertIs(self.server.registry.get_route(self.network_a, self.ip_a), session)
 

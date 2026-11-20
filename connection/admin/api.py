@@ -4,8 +4,9 @@ import math
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import parse_qs
 
-import bcrypt
 from bson import ObjectId
+
+from connection import srp
 
 from connection.admin.members import (account_id_of, blocked_rows, can, online_rows,
                                       page_of, query_of, read_blocked)
@@ -136,11 +137,10 @@ def register_api(http: VirtualHTTPServer, vpn_server, interval: float = 1,
         collection = vpn_server.table_name['accounts']
 
         def check():
-            # Worker thread: the database read and bcrypt stay off the loop.
+            # Worker thread: the database read and the stretched check stay off the loop.
             try:
                 account = Account(collection, account_id).get() or {}
-                stored = account.get('password', '').encode()
-                return bool(stored) and bcrypt.checkpw(password.encode(), stored)
+                return srp.check(password, account.get('srp'))
             except Exception:
                 logger.exception('Password check failed')
                 return None

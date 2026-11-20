@@ -1,14 +1,13 @@
 import json
 import time
 
-import bcrypt
 from bson import ObjectId
 from tcp_sansio import TCPStack
 
 from connection.admin import register_admin
 from connection.organizations import Organizations
-from connection.protocol import ClientHandshake
 from connection.vpn_service import VPNServer
+from tests import RECORD, login
 from tests import test_vpn_service as tunnel
 from tests.test_organizations import Collection
 
@@ -43,20 +42,14 @@ class Panel:
 
     def account(self, username):
         account_id = ObjectId()
-        password = bcrypt.hashpw(b'password123*', bcrypt.gensalt(4)).decode()
         self.collections['accounts'].documents.append(dict(
             _id=account_id, username=username, email=f'{username}@example.com',
-            password=password, networks={}
+            srp=RECORD, networks={}
         ))
         return account_id
 
     def vpn(self, username, address, network_id=None):
-        client = ClientHandshake(self.server.public_key)
-        self.server.receive_handshake((client.hello(), address))
-        client.server_hello(self.server.server.packets.pop()[0])
-        credentials = client.credentials(username, 'password123*')
-        self.server.receive_handshake((credentials, address))
-        cipher = client.configuration(self.server.server.packets.pop()[0])
+        cipher = login(self.server, address, username)
         reply = self.control(self.server, cipher, address, action='connect',
                              network_id=str(network_id or self.network_id))
         return cipher, reply['configuration'][0]['ip_address']

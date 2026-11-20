@@ -7,14 +7,14 @@ This project consists of a client and server VPN that allows you to create virtu
 </p>
 
 ## Server Features
-- Credential Security: User passwords are not stored in plain text, ensuring enhanced security.
+- Credential Security: Passwords never leave the client and are not stored: the server keeps only an SRP verifier.
 - Transfer Statistics: Real-time statistics on the data transfer rate for each user account.
 - In-Memory Routing: Authenticated sessions and virtual routes stay in memory, so packets do not query MongoDB while being forwarded.
 - Multi-Network Sessions: One encrypted connection can enter several virtual networks through a single client TUN interface.
 - Flexible Network Identity: A membership can reserve an independent address or reuse an address assigned by another network.
 - Independent Virtual Networks: Each created network is independent, increasing user privacy.
 - Authenticated Encryption: Every packet uses ChaCha20-Poly1305 with a unique counter, an authentication tag, and replay protection.
-- Secure Handshake: X25519 creates ephemeral traffic keys and Ed25519 verifies the identity of the VPN server before credentials are sent.
+- Password Handshake: SRP-6a proves the password on both sides, so clients only need the server address and port.
 
 ## Future Features
 - Full Routing: Implementing the ability to access any address from the VPN client when the server has this feature enabled.
@@ -28,29 +28,40 @@ from pymongo import MongoClient
 from connection import VPNServer
 
 client = MongoClient("mongodb://localhost:27017/")
-# On the first run this value can be None. Save vpn_server.private_key
-# securely and replace it here so that the server keeps the same identity.
-private_key = None
-vpn_server = VPNServer(client, 'test_network', private_key)
+# public=True lets anyone create an account from the client.
+vpn_server = VPNServer(client, 'test_network', public=True)
 # Optionally, you can specify an IP address.
 vpn_server.ip_address = '127.0.0.1'
-print('Client public key:', vpn_server.public_key)
 vpn_server.run_server(port=5732)
 ```
+
+From the command line, `python -m connection serve --public` does the same and
+keeps its secret in `server.key`. On a server without `--public`, the operator
+creates each account with `python -m connection account <username> <email>`.
 
 ## How to Connect to the Server
 To connect to the VPN server, you can follow these steps:
 
 ```python
-from connection import VPNClient
+from connection import VPNClient, VPNError
 
-# Specify the server's address, port, and previously verified public key.
-server_key = 'server-public-key-in-hexadecimal'
-vpn_client = VPNClient(('127.0.0.1', 5732), server_key)
-# Replace with the appropriate credentials.
-credentials = 'Username', 'password123*'
-vpn_client.connect(credentials, 'my_interface')
+# Only the server's address and port are needed.
+vpn_client = VPNClient(('127.0.0.1', 5732))
+# Once, on a public server: the password itself is never sent.
+vpn_client.register('username', 'user@example.com', 'password123*')
+vpn_client.authenticate('username', 'password123*')
+if not vpn_client.list_networks():
+    # A new account has no networks: it founds an organization, or waits until
+    # an administrator adds its email to one from the panel.
+    vpn_client.create_organization('My organization')
+vpn_client.connect(interface='my_interface')
 ```
+
+Code, a command line and a visual interface use these same calls. Every failure
+they must handle is a `VPNError` whose `code` is stable (`no_networks`,
+`incorrect_credentials`, `username_taken`, `too_many_attempts`, ...) and whose
+`details` carry any numbers, such as `wait`. `connection.errors.MESSAGES` lists
+every code with a default English text, so each interface can translate by code.
 
 ## Multiple Network Access
 
@@ -104,10 +115,19 @@ packets still use the existing UDP tunnel and do not query MongoDB.
 
 ## Packet Protocol
 
-The handshake takes place over the same UDP socket in three exchanges. The client
-creates an ephemeral X25519 key, verifies the server's Ed25519 signature, and then
-sends its credentials encrypted. HKDF derives independent client-to-server and
-server-to-client keys without sending them through the network.
+The handshake takes place over the same UDP socket. An ephemeral X25519 exchange
+hides everything that follows. Registration sends the username, the email and an
+SRP verifier computed by the client (PBKDF2-SHA256 over the password). A login
+runs SRP-6a on the 2048-bit group of RFC 5054: both sides prove the password
+without sending it, and HKDF derives independent client-to-server and
+server-to-client keys from the X25519 secret, the SRP key and the whole
+transcript. Someone relaying in the middle can neither read the traffic nor
+finish the login. The only exposed moment is the registration itself, if an
+impostor answers it: it would see the verifier, never the password.
+
+Unknown usernames receive an invented but stable challenge, so the answers do
+not reveal who has an account. Repeated failures from a name or an address wait
+longer each time, and an address creates at most five accounts per hour.
 
 The server returns the complete encrypted membership list, including assigned
 addresses, routed identities, network ranges, and return routes.

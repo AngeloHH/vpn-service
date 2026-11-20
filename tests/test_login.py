@@ -84,14 +84,14 @@ class LoginTest(Panel, unittest.TestCase):
         self.assertTrue(content['administrator'])
 
     def test_the_password_is_checked_off_the_packet_loop(self):
-        threads, checkpw = [], api.bcrypt.checkpw
+        threads, check = [], api.srp.check
 
         def record(*arguments):
             threads.append(threading.current_thread())
-            return checkpw(*arguments)
+            return check(*arguments)
 
         channel = self.open('owner', self.address)
-        with mock.patch.object(api.bcrypt, 'checkpw', side_effect=record):
+        with mock.patch.object(api.srp, 'check', side_effect=record):
             self.assertEqual(self.login(channel)[0], 204)
         self.assertNotEqual(threads, [threading.main_thread()])
         self.assertEqual(len(threads), 1)
@@ -128,7 +128,7 @@ class LoginTest(Panel, unittest.TestCase):
         body = b'{"password":"password123*"}'
         request = (f'POST /api/login HTTP/1.1\r\nHost: {PANEL}\r\nX-Requested-With: vpn-panel\r\n'
                    f'Content-Length: {len(body)}\r\n\r\n').encode() + body
-        with mock.patch.object(api.bcrypt, 'checkpw', side_effect=replaced):
+        with mock.patch.object(api.srp, 'check', side_effect=replaced):
             channel[2].send(request)
             self.exchange(channel, lambda data: False)
         self.assertEqual(self.server.web_sessions.sessions, {})

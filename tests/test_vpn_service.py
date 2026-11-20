@@ -1,15 +1,15 @@
 import re
 import unittest
 
-import bcrypt
 from bson import ObjectId
 from scapy.layers.inet import IP
 from scapy.packet import Raw
 from tcp_sansio import TCPStack
 
 
+from tests import RECORD, login
 from connection.database.mongodb import Account, Network
-from connection.protocol import ClientHandshake, Control, Protocol
+from connection.protocol import Control, Protocol
 from connection.virtual_http import HTTPResponse
 from connection.vpn_service import VPNServer
 
@@ -77,10 +77,9 @@ class Socket:
 class VPNServiceTest(unittest.TestCase):
     def server(self):
         account_id, network_id = ObjectId(), ObjectId()
-        password = bcrypt.hashpw(b'password123*', bcrypt.gensalt(4)).decode()
         collections = {
             'accounts': Collection([dict(
-                _id=account_id, username='username', password=password,
+                _id=account_id, username='username', srp=RECORD,
                 networks={network_id.__str__(): dict(
                     mode='assigned', primary=True
                 )}
@@ -98,12 +97,7 @@ class VPNServiceTest(unittest.TestCase):
         return server, collections
 
     def login(self, server, address):
-        client = ClientHandshake(server.public_key)
-        server.receive_handshake((client.hello(), address))
-        client.server_hello(server.server.packets.pop()[0])
-        credentials = client.credentials('username', 'password123*')
-        server.receive_handshake((credentials, address))
-        return client.configuration(server.server.packets.pop()[0])
+        return login(server, address)
 
     def control(self, server, cipher, address, request=None, **message):
         if request is None: request = cipher.counter + 1
@@ -146,9 +140,8 @@ class VPNServiceTest(unittest.TestCase):
 
     def test_routed_access_reuses_the_primary_network_address(self):
         account_id, primary_id, routed_id = ObjectId(), ObjectId(), ObjectId()
-        password = bcrypt.hashpw(b'password123*', bcrypt.gensalt(4)).decode()
         accounts = Collection([dict(
-            _id=account_id, username='username', password=password, networks={}
+            _id=account_id, username='username', srp=RECORD, networks={}
         )])
         networks = Collection([
             dict(_id=primary_id, subnet_mask='255.255.255.0',
