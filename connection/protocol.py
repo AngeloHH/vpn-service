@@ -296,9 +296,9 @@ class ClientHandshake(Handshake):
     def registered(self, packet: bytes):
         self.answer(packet, Protocol.registered)
 
-    def login(self, username: str, password: str) -> bytes:
+    def login(self, username: str, password: str = None, known: tuple = None) -> bytes:
         if len(username.encode()) > 1024: raise ValueError('The username is too long')
-        self.srp = srp.Client(username, password)
+        self.srp = srp.Client(username, password, known=known)
         self.login_packet = self.request(Steps.login, pack_fields(username.encode(), srp.GROUP.pad(self.srp.public)))
         return self.login_packet
 
@@ -327,6 +327,8 @@ class Control:
     # Control messages share the session cipher but never reach the TUN.
     list_networks, connect, disconnected = 'list', 'connect', 'disconnected'
     create_organization, account = 'create_organization', 'account'
+    # A quiet tunnel asks now and then; no answer means the server lost the session.
+    ping = 'ping'
     # Unlike disconnected, kicked ends the login: the client must not reconnect.
     kicked = 'kicked'
     required = {'network_id', 'mode', 'ip_address', 'subnet_mask',

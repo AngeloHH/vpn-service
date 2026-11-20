@@ -99,11 +99,13 @@ def fake(secret: bytes, username: str) -> dict:
 
 
 class Client:
-    def __init__(self, username: str, password: str, group: Group = GROUP, secret: int = None):
-        self.group, self.username, self.password = group, username.encode(), password
+    def __init__(self, username: str, password: str = None, group: Group = GROUP, secret: int = None,
+                 known: tuple = None):
+        # known: (salt, iterations, x) of an earlier login, to log in again without the password.
+        self.group, self.username, self.password, self.known = group, username.encode(), password, known
         self.a = secret or group.secret()
         self.public = pow(group.g, self.a, group.n)
-        self.key = self.expected = None
+        self.key = self.expected = self.stretched = None
 
     def challenge(self, salt: bytes, public_b: bytes, iterations: int = None, x: int = None) -> bytes:
         # The server's answer to the public value; the proof shows the password.
@@ -111,10 +113,14 @@ class Client:
         if public_b % group.n == 0: raise ValueError('Invalid server value')
         u = group.scramble(self.public, public_b)
         if u == 0: raise ValueError('Invalid server value')
+        if x is None and self.known and self.known[:2] == (salt, iterations): x = self.known[2]
         if x is None:
             if type(iterations) is not int or not MINIMUM <= iterations <= MAXIMUM:
                 raise ValueError('Invalid server value')
+            # Remembered only as this stretched value, never as the password.
+            if self.password is None: raise LookupError('The account changed its password')
             x = stretch(self.password, salt, iterations)
+        self.stretched = salt, iterations, x
         base = (public_b - group.k * pow(group.g, x, group.n)) % group.n
         self.key = group.hash(group.pad(pow(base, self.a + u * x, group.n)))
         proof = group.proof(self.username, salt, self.public, public_b, self.key)

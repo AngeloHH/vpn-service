@@ -220,6 +220,48 @@ class RegisterTest(PublicServer, unittest.TestCase):
         self.assertEqual((error.code, error.details, str(error)), (
             'organization_limit', dict(limit=ORGANIZATIONS), f'An account may administer at most {ORGANIZATIONS} organizations'))
 
+    def test_a_lost_session_logs_in_again_without_the_password(self):
+        self.register()
+        client = self.client()
+        client.authenticate('ana', PASSWORD)
+        created = client.create_organization('Taller')
+        client.select_network(created['network_id'])
+        # Only the stretched value stays in memory, never the password.
+        self.assertNotIn(PASSWORD, repr(client.remembered))
+        self.assertTrue(client.alive())
+        self.assertNotIn('error', client.request('ping'))
+        # The server restarts: same database, no sessions.
+        for socket_ in self.server.waker: socket_.close()
+        self.server = VPNServer(tunnel.MongoClient(self.database), 'database', public=True)
+        self.server.server.close()
+        self.server.server = tunnel.Socket()
+        client.socket_server.server = self.server
+        self.assertFalse(client.alive())
+        with mock.patch.object(VPNClient, 'RETRY', 0):
+            self.assertFalse(client.recover())
+        self.assertFalse(client.recovering)
+        session = self.server.registry.get_session(client.cipher.session_id)
+        self.assertEqual((session.username, client.network_id), ('ana', created['network_id']))
+        self.assertTrue(client.alive())
+
+    def test_recovery_stops_on_a_changed_password_or_when_asked(self):
+        self.register()
+        client = self.client()
+        client.authenticate('ana', PASSWORD)
+        client.network_id = None
+        account = self.accounts()[0]
+        account['srp'] = srp.verifier('otra clave')
+        with self.assertRaises(VPNError) as raised: client.authenticate('ana')
+        self.assertEqual(raised.exception.code, 'incorrect_credentials')
+        # Recovery gives up on it instead of trying forever.
+        with self.assertRaises(VPNError) as raised: client.recover()
+        self.assertEqual(raised.exception.code, 'incorrect_credentials')
+        # The server stays silent: recovery waits until it is told to stop.
+        client.socket_server.sendto = lambda packet, address: None
+        client.stop()
+        with mock.patch.object(VPNClient, 'RETRY', 0): self.assertTrue(client.recover())
+        self.assertFalse(client.recovering)
+
     def test_the_operator_creates_accounts_on_a_closed_server(self):
         mongo = tunnel.MongoClient(self.database)
         options = argparse.Namespace(username='carla', email='carla@example.com', mongo='', database='database')

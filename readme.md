@@ -79,7 +79,10 @@ prompt, or read from one line of standard input with `--password-stdin`. When th
 account has no networks, `register` and `connect` offer to found an organization;
 `--create-organization NAME` does it without asking. A command ends with 0 when it
 succeeds, 1 on an error (shown with its code) and 3 when the account has no
-networks and waits to be added to one. `connect` needs administrator rights to
+networks and waits to be added to one. If the server restarts or stops answering,
+`connect` keeps the network card and logs in again by itself (with the stretched
+password value, never the password) as soon as the server is back.
+`connect` needs administrator rights to
 create the network card; on Windows it also needs `wintun.dll` (inside the
 executable, beside it, or where the `VPN_WINTUN` variable points).
 

@@ -405,6 +405,7 @@ class VPNServer:
             reply.update(self.create_organization(session, message.get('name')))
         elif action == Control.account:
             reply.update(username=account.get('username'), email=account.get('email'))
+        elif action == Control.ping: pass
         else: reply.update(describe('unknown_action'))
         return reply
 
@@ -793,6 +794,7 @@ class VPNClient:
         self.request_id, self.error = 0, None
         self.disconnected, self.kicked = False, False
         self.pending, self.monitoring = b'', False
+        self.remembered, self.heard, self.recovering = None, 0, False
         self.connection = [self.server_address[0], '255.255.255.0']
         self.socket_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Commands from other threads enter the tunnel loop through select().
@@ -827,23 +829,27 @@ class VPNClient:
             handshake.registered(self.exchange(handshake.register(username, email, password)))
         except ValueError: raise VPNError('invalid_server') from None
 
-    def authenticate(self, username: str, password: str) -> PacketCipher:
+    def authenticate(self, username: str, password: str = None) -> PacketCipher:
         # The password proves both sides; a wrong one or an impostor fails here.
+        # Without a password it logs in again with the stretched value of the last login.
+        known = self.remembered[1] if password is None and self.remembered else None
         try:
             handshake = self.handshake()
-            login = handshake.login(username, password)
+            login = handshake.login(username, password, known)
             packet = self.exchange(handshake.challenge(self.exchange(login)))
             self.cipher, self.request_id = handshake.configuration(packet), 0
+        except LookupError: raise VPNError('incorrect_credentials') from None
         except ValueError: raise VPNError('invalid_server') from None
+        self.remembered = username, handshake.srp.stretched
         return self.cipher
 
     def receive(self, packet: bytes):
-        # Data reaches the TUN; control messages return to the caller.
+        # Data reaches the TUN; control messages return to the caller; False is not from the server.
         try: packet_type = Protocol.packet_type(packet)
-        except ValueError: return None
-        if packet_type not in (Protocol.data, Protocol.control): return None
+        except ValueError: return False
+        if packet_type not in (Protocol.data, Protocol.control): return False
         try: content = self.cipher.decrypt(packet, packet_type)
-        except (InvalidTag, ValueError): return None
+        except (InvalidTag, ValueError): return False
         if packet_type == Protocol.data:
             if self.tun and content:
                 self.speed_monitor.update_transfer(self.tun.write(content), 0)
@@ -926,7 +932,8 @@ class VPNClient:
         with self.speed_monitor.lock:
             download, upload = self.speed_monitor.speed
             received, sent = self.speed_monitor.transferred
-        return dict(connected=bool(self.networks), network_id=self.network_id, networks=list(self.networks),
+        return dict(connected=bool(self.networks) and not self.recovering, network_id=self.network_id,
+                    networks=list(self.networks), recovering=self.recovering,
                     download=download, upload=upload, received=received, sent=sent)
 
     def commanded(self, data: bytes) -> bool:
@@ -980,10 +987,10 @@ class VPNClient:
     def tunnel(self, network_id: str):
         self.select_network(network_id)
         if not self.monitoring: self.speed_monitor.start_monitoring()
-        self.monitoring = True
+        self.monitoring, self.heard = True, time.monotonic()
         sources = [self.tun, self.socket_server, self.commands[1]]
         while True:
-            for source in select.select(sources, [], [])[0]:
+            for source in select.select(sources, [], [], 1)[0]:
                 if source is self.tun:
                     packet = self.cipher.encrypt(source.read(source.mtu))
                     length = self.socket_server.sendto(packet, self.server_address)
@@ -992,6 +999,36 @@ class VPNClient:
                     if self.commanded(source.recv(4096)): return
                 else:
                     packet, address = source.recvfrom(65535)
-                    if address == self.server_address: self.receive(packet)
+                    if address == self.server_address and self.receive(packet) is not False:
+                        self.heard = time.monotonic()
                 if self.kicked: raise VPNError('session_ended')
                 if self.disconnected: self.reconnect()
+            if time.monotonic() - self.heard > self.KEEPALIVE and not self.alive():
+                if self.recover(): return
+
+    KEEPALIVE, RETRY = 10, 3
+
+    def alive(self) -> bool:
+        # A quiet tunnel asks the server; a restarted one no longer knows this session.
+        try: self.request(Control.ping)
+        except VPNError: return False
+        self.heard = time.monotonic()
+        return True
+
+    def recover(self) -> bool:
+        # Logs in again with the remembered login and the same network, keeping the card and
+        # its routes, until the server answers. Returns True when asked to stop meanwhile.
+        if not self.remembered: raise VPNError('server_unreachable')
+        self.recovering = True
+        try:
+            while True:
+                try:
+                    self.authenticate(self.remembered[0])
+                    self.select_network(self.network_id)
+                    self.heard = time.monotonic()
+                    return False
+                except VPNError as error:
+                    if error.code != 'server_unreachable': raise
+                ready = select.select([self.commands[1]], [], [], self.RETRY)[0]
+                if ready and self.commanded(self.commands[1].recv(4096)): return True
+        finally: self.recovering = False

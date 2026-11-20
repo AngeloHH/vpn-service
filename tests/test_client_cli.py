@@ -130,7 +130,7 @@ class ClientCLITest(PublicServer, unittest.TestCase):
             self.assertFalse(client.commanded(b'eee\n'))
         self.assertEqual(client.error.code, 'network_unavailable')
         client.speed_monitor.speed, client.speed_monitor.transferred = [5, 6], [7, 8]
-        self.assertEqual(client.status(), dict(connected=False, network_id=None, networks=[], download=5, upload=6,
+        self.assertEqual(client.status(), dict(connected=False, network_id=None, networks=[], recovering=False, download=5, upload=6,
                                                received=7, sent=8))
 
     def test_a_tunnel_releases_its_routes_once(self):
