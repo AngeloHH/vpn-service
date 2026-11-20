@@ -13,7 +13,6 @@ from typing import Optional
 from bson import ObjectId
 from cryptography.exceptions import InvalidTag
 from pymongo import MongoClient
-from scapy.layers.inet import IP
 
 from connection import __version__
 from connection import srp
@@ -537,11 +536,6 @@ class VPNServer:
         elif packet_type == Protocol.authentication and state:
             self.receive_authentication(packet, address, state)
 
-    def get_destination(self, session: Session, packet: bytes):
-        packet = IP(packet)
-        client = self.registry.get_destination(session, packet.src, packet.dst)
-        return client, packet
-
     def apply_limits(self, session: Session, network_id):
         # The connection's main network decides the network limit, routed ones included.
         organization_id = session.organization_id
@@ -613,28 +607,29 @@ class VPNServer:
             session.connection = address
             self.send_control(session, dict(action=Control.disconnected))
             return
-        try: packet = IP(raw)
-        except Exception: return
-        if not session.owns_address(packet.src): return
+        # Only IPv4: both addresses are read from the header, no parsing library per packet.
+        if len(raw) < 20 or raw[0] >> 4 != 4: return
+        source, destination = socket.inet_ntoa(raw[12:16]), socket.inet_ntoa(raw[16:20])
+        if not session.owns_address(source): return
         # Valid packets may safely refresh a connection changed by NAT.
         session.connection, session.last_packet = address, time.monotonic()
-        self.update_transfer(session.account_id, len(packet))
-        self.count_traffic(session, len(packet), False)
-        if self.forward(session, packet.dst, raw): return
-        bridge = self.get_bridge(session, packet.src, packet.dst)
+        self.update_transfer(session.account_id, len(raw))
+        self.count_traffic(session, len(raw), False)
+        if self.forward(session, destination, raw): return
+        bridge = self.get_bridge(session, source, destination)
         if bridge:
-            try: packets = bridge.receive(bytes(packet))
+            try: packets = bridge.receive(raw)
             except (ValueError, ConnectionError, KeyError): return
             self.forward_bridge(bridge, packets)
             return
-        network_id, client = self.registry.find_destination(session, packet.src, packet.dst)
+        network_id, client = self.registry.find_destination(session, source, destination)
         if client:
             # Seguridad: the network's rules between members decide first.
             if not self.firewall.allows(network_id, session, client, raw): return
             if not session.limiter.allow('up', len(raw)): return
-            return self.deliver(client, bytes(packet), 'network')
+            return self.deliver(client, raw, 'network')
         # Outside every network of the session: the internet, if a network allows it.
-        if self.internet and session.internet and not session.inside(packet.dst):
+        if self.internet and session.internet and not session.inside(destination):
             # The network limit applies first; the internet limit adds to it.
             if not session.limiter.allow('up', len(raw), True): return
             self.egress.outbound(session, raw)
