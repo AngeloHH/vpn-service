@@ -83,6 +83,20 @@ networks and waits to be added to one. `connect` needs administrator rights to
 create the network card; on Windows it also needs `wintun.dll` (inside the
 executable, beside it, or where the `VPN_WINTUN` variable points).
 
+### Desktop application
+
+A window with the panel's look (light and dark themes; Spanish, English, Chinese
+and Russian) over the same calls: log in, create an account, found an
+organization or wait to be added, choose a network, connect and disconnect, and
+open the network's panel.
+
+```
+pip install -r requirements-desktop.txt
+python -m connection.desktop
+```
+
+The server and username are remembered; the password never is.
+
 ## Multiple Network Access
 
 An account keeps one encrypted session even when it can access several networks.
