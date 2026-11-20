@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pymongo import MongoClient
 
-from connection import srp
+from connection import client_cli, srp
 from connection.admin import register_admin
 from connection.database.mongodb import Account
 from connection.vpn_service import EMAIL, USERNAME, VPNServer, exactly
@@ -74,9 +74,15 @@ def main(arguments: list[str] = None):
     command.add_argument('email')
     command.add_argument('--mongo', default='mongodb://localhost:27017/')
     command.add_argument('--database', default='vpn_service')
+    # The client: the same calls code and a visual interface use.
+    client_cli.add_commands(commands)
     options = parser.parse_args(arguments)
     if options.command == 'serve': return serve(options)
     if options.command == 'account': return add_account(options)
+    return client_cli.run(options)
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    # Client commands end with their exit code; the server runs until stopped.
+    result = main()
+    if type(result) is int: raise SystemExit(result)

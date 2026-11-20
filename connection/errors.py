@@ -30,6 +30,7 @@ MESSAGES = {
     'session_ended': 'An administrator ended this session',
     'unknown_action': 'Unknown control action',
     'tun_missing': 'A TUN driver is required to connect the VPN client',
+    'tunnel_failed': 'The network interface could not be created: {reason}',
 }
 
 

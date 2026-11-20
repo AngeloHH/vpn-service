@@ -1,6 +1,6 @@
 # Simple VPN
 
-This project consists of a client and server VPN that allows you to create virtual networks without the need to create new network interfaces on the server. It was primarily developed to enhance my skills in socket programming, thread management, and selectors. To create virtual network interfaces on the client side, the pytun library is used, and user and network information is stored in a MongoDB database.
+This project consists of a client and server VPN that allows you to create virtual networks without the need to create new network interfaces on the server. It was primarily developed to enhance my skills in socket programming, thread management, and selectors. The client creates its virtual network card with the system's own TUN on Linux (/dev/net/tun) and macOS (utun), and with Wintun on Windows; user and network information is stored in a MongoDB database.
 
 <p style="text-align: center">
 <img src="./network_picture.png" alt="network-picture">
@@ -62,6 +62,26 @@ they must handle is a `VPNError` whose `code` is stable (`no_networks`,
 `incorrect_credentials`, `username_taken`, `too_many_attempts`, ...) and whose
 `details` carry any numbers, such as `wait`. `connection.errors.MESSAGES` lists
 every code with a default English text, so each interface can translate by code.
+
+### From the command line
+
+The same steps, over the same calls:
+
+```
+python -m connection register vpn.example.com ana ana@example.com
+python -m connection networks vpn.example.com ana
+python -m connection organization vpn.example.com ana "My organization"
+python -m connection connect vpn.example.com ana --interface vpn0
+```
+
+The server is `host` or `host:port` (5732 by default). Passwords are typed at a
+prompt, or read from one line of standard input with `--password-stdin`. When the
+account has no networks, `register` and `connect` offer to found an organization;
+`--create-organization NAME` does it without asking. A command ends with 0 when it
+succeeds, 1 on an error (shown with its code) and 3 when the account has no
+networks and waits to be added to one. `connect` needs administrator rights to
+create the network card; on Windows it also needs `wintun.dll` (inside the
+executable, beside it, or where the `VPN_WINTUN` variable points).
 
 ## Multiple Network Access
 

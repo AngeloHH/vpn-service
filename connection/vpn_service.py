@@ -40,6 +40,7 @@ from connection.protocol import (ClientHandshake, Control, PacketCipher,
 from connection.session import NetworkAccess, Session, SessionRegistry
 from connection.system import MODEL, ProcessMetrics
 from connection.tcp_bridge import VirtualHTTPBridge
+from connection import tun as devices
 from connection.utils import configure_networks, remove_networks
 from connection.virtual_http import VirtualHTTPServer
 
@@ -791,6 +792,7 @@ class VPNClient:
         self.tun, self.interface = None, None
         self.request_id, self.error = 0, None
         self.disconnected, self.kicked = False, False
+        self.pending, self.monitoring = b'', False
         self.connection = [self.server_address[0], '255.255.255.0']
         self.socket_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Commands from other threads enter the tunnel loop through select().
@@ -898,8 +900,7 @@ class VPNClient:
         # Undo the previous network before the new identity is configured.
         primary = next(network for network in networks if network['primary'])
         if self.networks: remove_networks(self.interface, self.networks, self.server_address[0])
-        self.tun.addr, self.tun.netmask = primary['ip_address'], primary['subnet_mask']
-        if not self.networks: self.tun.persist(True), self.tun.up()
+        self.tun.configure(primary['ip_address'], primary['subnet_mask'])
         configure_networks(self.interface, networks, self.server_address[0])
         self.connection = primary['ip_address'], primary['subnet_mask']
         self.networks = networks
@@ -914,13 +915,33 @@ class VPNClient:
 
     def switch(self, network_id: str):
         # Safe from another thread; the tunnel loop performs the change.
-        self.commands[0].send(network_id.encode())
+        self.commands[0].send(network_id.encode() + b'\n')
+
+    def stop(self):
+        # Safe from another thread: the tunnel ends and removes its routes.
+        self.commands[0].send(b'stop\n')
+
+    def status(self) -> dict:
+        # What any interface shows while connected; safe from another thread.
+        with self.speed_monitor.lock:
+            download, upload = self.speed_monitor.speed
+            received, sent = self.speed_monitor.transferred
+        return dict(connected=bool(self.networks), network_id=self.network_id, networks=list(self.networks),
+                    download=download, upload=upload, received=received, sent=sent)
+
+    def commanded(self, data: bytes) -> bool:
+        # Returns True when asked to stop; a rejected switch keeps the current network.
+        self.pending += data
+        *lines, self.pending = self.pending.split(b'\n')
+        for line in lines:
+            if line == b'stop': return True
+            try: self.select_network(line.decode())
+            except (UnicodeDecodeError, VPNError) as error: self.error = error
+        return False
 
     def new_tunnel(self, interface: str):
-        try: import pytun
-        except ImportError: raise VPNError('tun_missing') from None
-        flags = pytun.IFF_TUN | pytun.IFF_NO_PI
-        return pytun.TunTapDevice(name=interface, flags=flags)
+        # Linux and macOS use the kernel's TUN; Windows, the wintun.dll in the executable.
+        return devices.open_device(interface, self.mtu)
 
     def reconnect(self):
         # A notice means the server changed this membership; read it again.
@@ -933,7 +954,6 @@ class VPNClient:
             try: return self.select_network(default['network_id'])
             except VPNError as error:
                 if error.code == 'server_unreachable': raise
-        remove_networks(self.interface, self.networks, self.server_address[0])
         raise VPNError('network_lost')
 
     def connect(self, credentials: tuple = None, interface: str = 'vpn0', network_id: str = None):
@@ -942,10 +962,25 @@ class VPNClient:
         networks = self.list_networks()
         if not networks: raise VPNError('no_networks')
         default = next((network for network in networks if network['default']), networks[0])
-        self.tun, self.interface = self.new_tunnel(interface), interface
-        self.tun.mtu = self.mtu
-        self.select_network(network_id or default['network_id'])
-        self.speed_monitor.start_monitoring()
+        # macOS chooses the card's name (utunN): routes use the one it got.
+        self.tun = self.new_tunnel(interface)
+        self.interface = self.tun.name
+        # Whatever ends the tunnel (an error, Ctrl+C, a closed window) removes its routes.
+        try: self.tunnel(network_id or default['network_id'])
+        finally: self.release()
+
+    def release(self):
+        # Addresses and routes of this session leave the computer, once.
+        if self.networks and self.interface:
+            remove_networks(self.interface, self.networks, self.server_address[0])
+        self.networks = []
+        if self.tun: self.tun.close()
+        self.tun = None
+
+    def tunnel(self, network_id: str):
+        self.select_network(network_id)
+        if not self.monitoring: self.speed_monitor.start_monitoring()
+        self.monitoring = True
         sources = [self.tun, self.socket_server, self.commands[1]]
         while True:
             for source in select.select(sources, [], [])[0]:
@@ -954,13 +989,9 @@ class VPNClient:
                     length = self.socket_server.sendto(packet, self.server_address)
                     self.speed_monitor.update_transfer(0, length)
                 elif source is self.commands[1]:
-                    # A rejected switch keeps the current network active.
-                    try: self.select_network(source.recv(64).decode())
-                    except (UnicodeDecodeError, VPNError) as error: self.error = error
+                    if self.commanded(source.recv(4096)): return
                 else:
                     packet, address = source.recvfrom(65535)
                     if address == self.server_address: self.receive(packet)
-                if self.kicked:
-                    remove_networks(self.interface, self.networks, self.server_address[0])
-                    raise VPNError('session_ended')
+                if self.kicked: raise VPNError('session_ended')
                 if self.disconnected: self.reconnect()
