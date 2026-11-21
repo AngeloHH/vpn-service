@@ -327,7 +327,9 @@ document.addEventListener("click", (e) => {
         // Its only network here: removing it takes the account out of the organization.
         if (result.status === 409) return modal(t("{name} saldrá de la organización", {name: esc(row.username)}),
             `<p style="margin:0;font-size:14px">${t("No tiene otra red en esta organización: se desconecta y pierde el acceso hasta que lo vuelvan a añadir.")}</p>`,
-            t("Quitar igual"), () => removeMember(true), {danger: true});
+            t("Quitar igual"), () => {
+                removeMember(true);
+            }, {danger: true});
         if (result.message) return toast(result.message, "bad");
         done(result.data && result.data.left ? t("{name} salió de la organización.", {name: row.username}) : t("{name} ya no está en esta red.", {name: row.username}));
     });
