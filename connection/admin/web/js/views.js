@@ -137,7 +137,38 @@ function renderNav() {
         return `<button type="button" data-go="${id}"${id === page ? ' aria-current="page"' : ""}${inGroup ? " data-open" : ""}><svg viewBox="0 0 18 18" aria-hidden="true">${IC[id]}</svg>${t(label)}</button>` +
             (kids ? `<div class="rt-subnav" role="group" aria-label="${esc(t(label))}">${kids.map(([k, kt]) => `<button type="button" class="rt-sub" data-go="${k}"${k === page ? ' aria-current="page"' : ""}>${esc(kt)}</button>`).join("")}</div>` : "");
     }).join("")).join("");
+    // On a phone the strip scrolls sideways: the current section is brought into view.
+    const nav = $("[data-nav]"), current = $("[aria-current=page]", nav);
+    if (current && nav.scrollWidth > nav.clientWidth) {
+        const left = current.getBoundingClientRect().left - nav.getBoundingClientRect().left + nav.scrollLeft;
+        nav.scrollLeft = left - (nav.clientWidth - current.offsetWidth) / 2;
+    }
 }
+
+// Stacked rows on a phone show each value with its column name, taken from the header.
+function labelTables(root) {
+    for (const table of root.querySelectorAll("table.rt-table")) {
+        const names = [...table.querySelectorAll("thead th")].map((th) =>
+            [...th.childNodes].map((node) => node.textContent.trim()).filter(Boolean).join(" · "));
+        for (const row of table.querySelectorAll("tbody tr")) {
+            let column = 0;
+            for (const cell of row.children) {
+                if (!cell.hasAttribute("data-label") && !cell.hasAttribute("colspan")) cell.dataset.label = names[column] || "";
+                column += Number(cell.getAttribute("colspan")) || 1;
+            }
+        }
+    }
+}
+
+let labelPending = false;
+new MutationObserver(() => {
+    if (labelPending) return;
+    labelPending = true;
+    requestAnimationFrame(() => {
+        labelPending = false;
+        labelTables(document);
+    });
+}).observe(document.body, {childList: true, subtree: true});
 
 function render() {
     closeMenu();
@@ -162,6 +193,7 @@ const knownPage = (p) => !!P[p] || !!netPageId(p);
 function go(p) {
     if (p === page) return;
     const doGo = () => {
+        dropLimitEdits();
         page = p;
         draft = clone(S);
         errors = {};

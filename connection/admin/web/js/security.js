@@ -73,10 +73,10 @@ async function loadSecurity() {
     if (page === "seguridad" && current && current.id === n.id) $("[data-main]").innerHTML = securityPage();
 }
 
-async function securityWrite(path, body, done) {
+async function securityWrite(path, body, done, action) {
     const result = await networkPost(path, body);
     if (result.message) return result.message;
-    toast(done);
+    toast(done, null, action);
     loadSecurity();
     return null;
 }
@@ -98,11 +98,14 @@ function readSide(f, prefix) {
 
 function securityRuleModal(n, rule) {
     const data = SECURITY[n.id];
-    const body = mfield(t("Acción"), "action", rule ? rule.action : "block", {options: [["block", t("Bloquear")], ["allow", t("Permitir")]]}) +
+    // A new rule starts without an action: saving the defaults must not block everything.
+    const actions = [["block", t("Bloquear")], ["allow", t("Permitir")]];
+    const body = mfield(t("Acción"), "action", rule ? rule.action : "", {options: rule ? actions : [["", t("Elija una acción")], ...actions]}) +
         sideFields("source", t("Desde"), rule && rule.source, data.roles) + sideFields("destination", t("Hacia"), rule && rule.destination, data.roles) +
         mfield(t("Tráfico"), "protocol", rule ? rule.protocol : "any", {options: Object.entries(TRAFFIC_NAMES).map(([value, label]) => [value, t(label)])}) +
         mfield(t("Puerto"), "port", rule && rule.port ? rule.port : "", {ph: t("Todos"), hint: t("Solo con TCP o UDP: el puerto de destino. Vacío, todos.")});
-    serverModal(rule ? t("Editar regla") : t("Nueva regla"), body, rule ? t("Guardar") : t("Crear"), (f) => {
+    serverModal(rule ? t("Editar regla") : t("Nueva regla"), body, rule ? t("Guardar") : t("Crear"), async (f) => {
+        if (!fv(f, "action")) return t("Elija si la regla permite o bloquea.");
         const port = fv(f, "port");
         const payload = {network_id: n.id, action: fv(f, "action"), source: readSide(f, "source"), destination: readSide(f, "destination"),
             protocol: fv(f, "protocol"), port: port === "" ? null : /^\d+$/.test(port) ? Number(port) : port, enabled: rule ? rule.enabled : true};
@@ -162,9 +165,12 @@ document.addEventListener("change", (e) => {
         el.disabled = false;
     };
     if (el.matches("[data-security-isolated]")) {
+        // It changes the whole network at once, so it can be undone from the notice.
+        const isolate = (on) => securityWrite("/api/security/isolated", {network_id: n.id, isolated: on},
+            on ? t("Miembros aislados.") : t("Los miembros vuelven a verse entre sí."),
+            {label: t("Deshacer"), run: () => isolate(!on).then((message) => message && toast(message, "bad"))});
         el.disabled = true;
-        return securityWrite("/api/security/isolated", {network_id: n.id, isolated: el.checked},
-            el.checked ? t("Miembros aislados.") : t("Los miembros vuelven a verse entre sí.")).then(done(el.checked));
+        return isolate(el.checked).then(done(el.checked));
     }
     if (el.matches("[data-rule-on]")) {
         const rule = securityRule(el);

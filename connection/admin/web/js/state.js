@@ -26,7 +26,12 @@ try {
     if ([4, 5, 8, 16, 24, 48].includes(size)) S.switchSize = size;
 } catch { }
 
-const dirty = () => (SLICES[page] || []).some((k) => JSON.stringify(draft[k]) !== JSON.stringify(S[k]));
+const formDirty = () => (SLICES[page] || []).some((k) => JSON.stringify(draft[k]) !== JSON.stringify(S[k]));
+// The limits tables of this page: a network's own, or the internet ones on Internet (WAN).
+const limitKeys = () => page === "internet" ? ["internet"] : networkOfPage() ? [networkOfPage().id] : [];
+const limitsDirty = () => limitKeys().filter((key) => LIMITS[key] && LIMITS[key].changed);
+// One model for everything typed into a page: the bar, Ctrl+S and the warning before leaving.
+const dirty = () => formDirty() || limitsDirty().length > 0;
 
 function syncSavebar() {
     $("[data-savebar]").toggleAttribute("data-show", dirty());
@@ -34,12 +39,18 @@ function syncSavebar() {
 
 /* ---------- Guardar ---------- */
 function save() {
-    // Only network pages have something to save.
-    if (networkOfPage()) return saveNetwork();
+    for (const key of limitsDirty()) saveLimits(key);
+    if (networkOfPage() && formDirty()) return saveNetwork();
+}
+
+// Edits of the limits are thrown away with the rest of the page's changes.
+function dropLimitEdits() {
+    for (const key of limitsDirty()) delete LIMITS[key];
 }
 
 function discard() {
     draft = clone(S);
     errors = {};
+    dropLimitEdits();
     render();
 }

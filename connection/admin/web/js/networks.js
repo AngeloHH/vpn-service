@@ -198,6 +198,28 @@ function afterNetworkRender() {
 }
 
 /* ---------- Guardar y acciones ---------- */
+const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const validIp = (text) => IPV4.test(text) && text.split(".").every((part) => +part <= 255);
+
+// The checks the panel can do itself, before any confirmation: [field, message] or null.
+function networkFormError(n, d, body) {
+    if (body.network_range != null) {
+        const [ip, bits] = d.range.split("/");
+        if (!validIp(ip || "") || !/^\d{1,2}$/.test(bits || "") || +bits < 1 || +bits > 30) return ["range", NETWORK_ERRORS.invalid_range()];
+        const size = 2 ** (32 - +bits), start = ipToInt(ip) - ipToInt(ip) % size, end = start + size - 1;
+        const other = (NETWORKS || []).find((x) => {
+            if (x.id === n.id) return false;
+            const [xip, xbits] = x.network_range.split("/"), xstart = ipToInt(xip), xend = xstart + 2 ** (32 - +xbits) - 1;
+            return start <= xend && xstart <= end;
+        });
+        if (other) return ["range", NETWORK_ERRORS.range_overlap({name: other.name, network_range: other.network_range})];
+    }
+    if (body.router != null && !validIp(d.router)) return ["router", NETWORK_ERRORS.invalid_address()];
+    if (body.dns && (body.dns.length > 2 || !body.dns.every(validIp))) return ["dns", NETWORK_ERRORS.invalid_dns()];
+    if (body.name != null && d.name.trim().length > 40) return ["name", NETWORK_ERRORS.invalid_name()];
+    return null;
+}
+
 function saveNetwork() {
     const n = networkOfPage(), k = sliceOf(n), d = draft[k], s = S[k];
     // The saved values travel too: the server refuses if someone changed them since.
@@ -239,6 +261,13 @@ function saveNetwork() {
         toast(t("Cambios guardados."));
         refreshNetworks();
     };
+    // A mistake is shown on its field before asking to reconnect anyone.
+    const invalid = networkFormError(n, d, body);
+    if (invalid) {
+        errors = {[k + "." + invalid[0]]: invalid[1]};
+        render();
+        return toast(invalid[1], "bad");
+    }
     if (body.network_range == null && body.router == null && body.internet == null && body.dns == null) return send();
     confirmBox(t("¿Aplicar el cambio?"), body.network_range != null
         ? t("Todas las IPs se reasignan desde el inicio del rango y los miembros de esta red se reconectan.")
@@ -289,7 +318,14 @@ Object.assign(ACT, {
     },
     "net-delete"() {
         const n = networkOfPage();
-        if (n) confirmBox(t("¿Eliminar {name}?", {name: esc(networkLabel(n))}), t("Sus miembros pasan a otra red que tengan en esta organización y se reconectan."), t("Eliminar"), () => deleteNetwork(n, false));
+        if (!n) return;
+        // Deleting reconnects every member: the network's name has to be written first.
+        const label = networkLabel(n);
+        modal(t("¿Eliminar {name}?", {name: esc(label)}), `<p style="margin:0 0 4px;font-size:14px">${t("Sus miembros pasan a otra red que tengan en esta organización y se reconectan.")}</p>
+            <div class="rt-field"><label for="m-typed">${t("Escriba {name} para confirmar", {name: `<strong>${esc(label)}</strong>`})}</label><div class="rt-ctl"><input class="rt-in" id="m-typed" data-md-typed autocomplete="off" spellcheck="false"></div></div>`,
+            t("Eliminar"), () => {
+                deleteNetwork(n, false);
+            }, {danger: true, typed: label});
     },
     "assign-add"() {
         const n = networkOfPage();

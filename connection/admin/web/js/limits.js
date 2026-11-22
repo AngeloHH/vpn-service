@@ -35,8 +35,8 @@ function limitsCard(networkId) {
     const people = data.members.map((m) => `<tr><td class="rt-name">${esc(m.username || "-")}<br><small ${muted}>${esc(m.email || "")}</small></td>
       ${cells("member:" + m.account_id, m, m.username)}
       <td class="rt-act"><button class="rt-btn" data-sm data-danger type="button" data-limit-drop="${esc(key)}" data-owner="${esc(m.account_id)}"${dis}>${t("Quitar")}</button></td></tr>`).join("");
-    const actions = data.can_edit ? `<button class="rt-btn" data-sm type="button" data-limit-add="${esc(key)}">${t("+ Persona")}</button>
-      <button class="rt-btn" data-sm data-primary type="button" data-limit-save="${esc(key)}"${data.changed ? "" : " disabled"}>${t("Guardar límites")}</button>` : "";
+    // Saved with the page's bar, like any other change typed here.
+    const actions = data.can_edit ? `<button class="rt-btn" data-sm type="button" data-limit-add="${esc(key)}">${t("+ Persona")}</button>` : "";
     const extras = (data.extras || []).map((x) => `<tr><td class="rt-name">${x.kind === "role" ? t("Rol {name}", {name: esc(x.name || "-")}) : esc(x.name || "-")}${x.email ? `<br><small ${muted}>${esc(x.email)}</small>` : ""}</td>
       <td>${x.down ? "+" + fromThousands(x.down) + " GB" : "-"}</td><td>${x.up ? "+" + fromThousands(x.up) + " GB" : "-"}</td>
       <td class="rt-act"><button class="rt-btn" data-sm data-danger type="button" data-extra-clear="${esc(key)}" data-kind="${x.kind}" data-owner="${esc(x.id)}"${dis}>${t("Quitar")}</button></td></tr>`).join("");
@@ -94,6 +94,7 @@ async function saveLimits(key) {
     const result = await networkPost("/api/limits", {network_id: key === "internet" ? null : key, limits});
     if (result.message) return toast(result.data && result.data.code === "invalid_limits" ? t("Revise los valores de los límites.") : result.message, "bad");
     data.changed = false;
+    syncSavebar();
     toast(t("Límites guardados. Ya se aplican a quienes están conectados."));
     loadLimits(key === "internet" ? null : key);
 }
@@ -103,18 +104,16 @@ document.addEventListener("input", (e) => {
     const key = e.target.dataset.limit, row = limitRow(key, e.target.dataset.owner);
     row[e.target.dataset.dir] = e.target.value;
     LIMITS[key].changed = true;
-    const save = $(`[data-limit-save="${key}"]`);
-    if (save) save.disabled = false;
+    syncSavebar();
 });
 
 document.addEventListener("click", (e) => {
-    const save = e.target.closest("[data-limit-save]"), add = e.target.closest("[data-limit-add]");
-    const drop = e.target.closest("[data-limit-drop]");
-    if (save && !save.disabled) return saveLimits(save.dataset.limitSave);
+    const add = e.target.closest("[data-limit-add]"), drop = e.target.closest("[data-limit-drop]");
     if (drop && !drop.disabled) {
         const key = drop.dataset.limitDrop, data = LIMITS[key];
         data.members = data.members.filter((m) => m.account_id !== drop.dataset.owner);
         data.changed = true;
+        syncSavebar();
         return paintLimits(key);
     }
     if (!add) return;
@@ -129,6 +128,7 @@ document.addEventListener("click", (e) => {
         if (data.members.some((m) => m.account_id === person.account_id)) return t("Esa persona ya tiene un límite propio.");
         data.members.push({...person, down: "", up: "", quota_down: "", quota_up: ""});
         data.changed = true;
+        syncSavebar();
         paintLimits(key);
     });
 });

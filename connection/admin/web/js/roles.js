@@ -179,10 +179,10 @@ function paintRoleMembers() {
     $("[data-role-pager]", box).innerHTML = roleMembersPager();
 }
 
-async function roleWrite(path, body, done) {
+async function roleWrite(path, body, done, action) {
     const result = await networkPost(path, body);
     if (result.message) return result.message;
-    toast(done);
+    toast(done, null, action);
     // Our own permissions may have changed with it.
     refreshMe();
     loadSystem();
@@ -266,13 +266,26 @@ document.addEventListener("change", (e) => {
         return loadRoleMembers();
     }
     if (!e.target.matches("[data-role-assign]")) return;
-    const member = roleMemberOf(e.target.dataset.roleAssign), role_id = e.target.value || null;
-    const role = ROLES.roles.find((r) => r.role_id === role_id);
-    e.target.disabled = true;
-    roleWrite("/api/roles/assign", {account_id: member.account_id, role_id},
-        role ? t("{name} ahora tiene el rol {role}.", {name: member.username, role: roleLabel(role.name)}) : t("{name} ya no tiene rol.", {name: member.username})).then((message) => {
-        if (!message) return;
-        toast(message, "bad");
-        paintRoleMembers();
-    });
+    const select = e.target, member = roleMemberOf(select.dataset.roleAssign), role_id = select.value || null;
+    const role = ROLES.roles.find((r) => r.role_id === role_id), previous = member.role_id || null;
+    const assign = (to, done, action) => {
+        select.disabled = true;
+        roleWrite("/api/roles/assign", {account_id: member.account_id, role_id: to}, done, action).then((message) => {
+            if (!message) return;
+            toast(message, "bad");
+            paintRoleMembers();
+        });
+    };
+    const done = role ? t("{name} ahora tiene el rol {role}.", {name: member.username, role: roleLabel(role.name)}) : t("{name} ya no tiene rol.", {name: member.username});
+    const undo = {label: t("Deshacer"), run: () => assign(previous, t("Se restauró el rol de {name}.", {name: member.username}))};
+    const apply = () => {
+        select.value = role_id || "";
+        assign(role_id, done, undo);
+    };
+    // Granting everything, or changing one's own access, asks first; the rest applies with Deshacer.
+    if (!(role && role.administrator) && !member.me) return apply();
+    select.value = previous || "";
+    if (member.me) return confirmBox(t("¿Cambiar su propio rol?"), t("Puede perder permisos en este panel y no podrá devolvérselos usted mismo."), t("Cambiar"), apply);
+    confirmBox(t("¿Dar el rol {role} a {name}?", {role: esc(roleLabel(role.name)), name: esc(member.username)}),
+        t("Tendrá todos los permisos de la organización, también cambiar roles y eliminar redes."), t("Dar el rol"), apply);
 });

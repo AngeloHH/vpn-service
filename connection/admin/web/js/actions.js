@@ -1,20 +1,31 @@
 "use strict";
 
 /* ---------- Avisos y ventanas ---------- */
-function toast(msg, tone) {
+// An action ({label, run}) adds a button such as "Deshacer"; errors and actions stay longer.
+function toast(msg, tone, action) {
     const el = document.createElement("div");
     el.className = "rt-toast";
     if (tone) el.dataset.tone = tone;
     el.textContent = msg;
+    if (action) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = action.label;
+        button.onclick = () => {
+            el.remove();
+            action.run();
+        };
+        el.append(" ", button);
+    }
     const box = $("[data-toasts]");
     box.append(el);
     while (box.children.length > 3) box.firstChild.remove();
-    setTimeout(() => el.remove(), 3200);
+    setTimeout(() => el.remove(), action ? 9000 : tone === "bad" ? 7000 : 3200);
 }
 
 let modalReturn = null;
 
-function modal(title, body, okText, onOk, {danger} = {}) {
+function modal(title, body, okText, onOk, {danger, typed} = {}) {
     modalReturn = document.activeElement;
     const host = $("[data-modal-host]");
     host.innerHTML = `<div class="rt-modal" data-modal><form class="rt-dialog" role="dialog" aria-modal="true" aria-labelledby="md-t" novalidate><h2 id="md-t">${title}</h2>${body}<div class="rt-err" data-md-err style="color:var(--anatomy-red);font-size:13px;min-height:18px;margin-top:8px"></div><div class="rt-dialog-act"><button class="rt-btn" type="button" data-md-cancel>${t("Cancelar")}</button><button class="rt-btn" ${danger ? "data-danger" : "data-primary"} type="submit">${okText}</button></div></form></div>`;
@@ -25,6 +36,7 @@ function modal(title, body, okText, onOk, {danger} = {}) {
     };
     f.addEventListener("submit", (e) => {
         e.preventDefault();
+        if (typed && $("[data-md-typed]", f).value.trim() !== typed) return;
         const err = onOk(f);
         if (err) {
             $("[data-md-err]", f).textContent = err;
@@ -39,7 +51,15 @@ function modal(title, body, okText, onOk, {danger} = {}) {
     f.addEventListener("keydown", (e) => {
         if (e.key === "Escape") close();
     });
-    (f.querySelector("input,select") || f.querySelector("[type=submit]")).focus();
+    // A destructive dialog opens on Cancelar: a reflexive Enter must not delete anything.
+    // typed: the dangerous button stays off until that exact text is written.
+    const submit = f.querySelector("[type=submit]");
+    if (typed) {
+        const input = f.querySelector("[data-md-typed]");
+        submit.disabled = true;
+        input.addEventListener("input", () => submit.disabled = input.value.trim() !== typed);
+    }
+    (danger && !typed ? $("[data-md-cancel]", f) : f.querySelector("input,select") || submit).focus();
 }
 
 const confirmBox = (title, text, okText, fn) => modal(title, `<p style="margin:0;font-size:14px">${text}</p>`, okText, () => {

@@ -77,20 +77,24 @@ const WRITE_ERRORS = {
     404: tk("El equipo ya no está conectado."),
 };
 
-async function memberWrite(path, body, done) {
+async function memberWrite(path, body, done, action) {
     const response = await api("POST", path, body).catch(() => null);
     if (!response) return toast(t("No se pudo contactar con el servidor."), "bad");
     if (response.status === 401) return showLogin();
     if (!response.ok) return toast(t(WRITE_ERRORS[response.status] || tk("La acción falló.")), "bad");
-    toast(done);
+    toast(done, null, action);
     loadMembers();
 }
 
 function memberAction(kind, id) {
     const m = memberOf(id);
     if (!m) return;
-    if (kind === "block") memberWrite("/api/members/block", {account_id: m.id, blocked: !m.blocked},
-        m.blocked ? t("{name} puede volver a conectarse.", {name: m.username}) : t("{name} bloqueado.", {name: m.username}));
+    const unblock = () => memberWrite("/api/members/block", {account_id: m.id, blocked: false}, t("{name} puede volver a conectarse.", {name: m.username}));
+    if (kind === "block" && m.blocked) unblock();
+    // Blocking ends the session and keeps it from coming back: it asks first, and can be undone.
+    if (kind === "block" && !m.blocked) confirmBox(t("¿Bloquear a {name}?", {name: esc(m.username)}),
+        t("Su sesión VPN termina y no podrá volver a conectarse hasta que alguien lo desbloquee. Lo encontrará en el filtro Sin conexión."), t("Bloquear"),
+        () => memberWrite("/api/members/block", {account_id: m.id, blocked: true}, t("{name} bloqueado.", {name: m.username}), {label: t("Deshacer"), run: unblock}));
     if (kind === "kick") confirmBox(t("¿Expulsar a {name}?", {name: esc(m.username)}), t("Su sesión VPN termina y el cliente no se reconecta solo."), t("Expulsar"),
         () => memberWrite("/api/sessions/kick", {account_id: m.id}, t("{name} expulsado.", {name: m.username})));
 }
