@@ -137,7 +137,7 @@ class ServeTest(unittest.TestCase):
         with mock.patch.object(cli, 'MongoClient', return_value=mongo), \
                 mock.patch.object(VPNServer, 'run_server'), \
                 mock.patch('builtins.print'):
-            server = cli.main(['serve', '--key', str(self.key), *arguments])
+            server = cli.main(['serve', '--key', str(self.key), '--workers', '1', *arguments])
         server.close()
         return server
 

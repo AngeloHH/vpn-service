@@ -11,8 +11,8 @@ from connection.admin.auth import WebSessions
 from tests.panel import PANEL, Panel
 
 
-def vpn_session(account_id=None, session_id=b'a' * 16):
-    return SimpleNamespace(account_id=account_id or ObjectId(),
+def vpn_session(account_id=None, session_id=b'a' * 16, organization_id='org-a'):
+    return SimpleNamespace(account_id=account_id or ObjectId(), organization_id=organization_id,
                            cipher=SimpleNamespace(session_id=session_id))
 
 
@@ -31,11 +31,22 @@ class WebSessionsTest(unittest.TestCase):
         for now in range(600, 28800, 600): self.web.valid(token, self.session, now=now)
         self.assertFalse(self.web.valid(token, self.session, now=28801))
 
-    def test_a_login_belongs_to_its_vpn_session(self):
+    def test_a_login_survives_a_vpn_reconnection_in_its_organization(self):
         token = self.web.create(self.session, now=0)
         reconnected = vpn_session(self.session.account_id, b'b' * 16)
-        self.assertFalse(self.web.valid(token, reconnected, now=1))
-        self.assertFalse(self.web.valid(token, self.session, now=1))
+        self.assertTrue(self.web.valid(token, reconnected, now=1))
+        elsewhere = vpn_session(self.session.account_id, b'c' * 16, organization_id='org-b')
+        self.assertFalse(self.web.valid(token, elsewhere, now=2))
+        self.assertFalse(self.web.valid(token, reconnected, now=3))
+
+    def test_ending_an_account_drops_its_logins_in_one_organization(self):
+        other = vpn_session(self.session.account_id, organization_id='org-b')
+        here, there = self.web.create(self.session, now=0), self.web.create(other, now=0)
+        stranger = self.web.create(vpn_session(), now=0)
+        self.web.end(self.session.account_id, 'org-a')
+        self.assertEqual(set(self.web.sessions), {there, stranger})
+        self.web.end(self.session.account_id)
+        self.assertEqual(set(self.web.sessions), {stranger})
 
     def test_the_wait_starts_at_the_third_failure_and_doubles(self):
         account_id = self.session.account_id
@@ -133,9 +144,18 @@ class LoginTest(Panel, unittest.TestCase):
             self.exchange(channel, lambda data: False)
         self.assertEqual(self.server.web_sessions.sessions, {})
 
-    def test_a_vpn_reconnection_needs_a_new_login(self):
+    def test_a_vpn_reconnection_keeps_the_panel_login(self):
         channel = self.open('owner', self.address)
         cookie = self.login(channel)[1]
+        # A new VPN login, as after a lost connection, still has the panel open.
+        channel = self.open('owner', self.address)
+        self.assertEqual(self.request(channel, 'GET', '/api/status', cookie)[0], 200)
+
+    def test_a_kick_ends_the_panel_login(self):
+        channel = self.open('owner', self.address)
+        cookie = self.login(channel)[1]
+        self.server.kick(self.owner)
+        self.server.server.packets.clear()
         channel = self.open('owner', self.address)
         self.assertEqual(self.request(channel, 'GET', '/api/status', cookie)[0], 401)
 

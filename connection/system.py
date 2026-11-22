@@ -32,15 +32,33 @@ def temperature():
 
 
 class ProcessMetrics:
-    def __init__(self):
-        # The first CPU sample only starts the measurement window.
-        self.process, self.cores = psutil.Process(), psutil.cpu_count() or 1
-        self.process.cpu_percent(None)
+    def __init__(self, root: int = None):
+        # The whole server: with several workers, the parent and every worker it started.
+        self.process, self.cores = psutil.Process(root), psutil.cpu_count() or 1
+        self.tree = root is not None
+        self.known = {}
+        self.members()
+
+    def members(self) -> list:
+        # The first CPU sample of each process only starts its measurement window.
+        processes = [self.process, *(self.process.children() if self.tree else [])]
+        known = {}
+        for process in processes:
+            known[process.pid] = self.known.get(process.pid)
+            if known[process.pid]: continue
+            try: process.cpu_percent(None)
+            except psutil.Error: continue
+            known[process.pid] = process
+        self.known = {pid: process for pid, process in known.items() if process}
+        return list(self.known.values())
 
     def sample(self) -> dict:
         # CPU is normalized to the whole machine, so 100% means every core.
-        cpu = self.process.cpu_percent(None) / self.cores
-        memory = self.process.memory_info().rss
-        return dict(cpu=round(cpu, 1), memory=memory,
-                    memory_percent=round(self.process.memory_percent(), 1),
+        cpu = memory = 0
+        for process in self.members():
+            try: cpu, memory = cpu + process.cpu_percent(None), memory + process.memory_info().rss
+            except psutil.Error: continue
+        total = psutil.virtual_memory().total
+        return dict(cpu=round(cpu / self.cores, 1), memory=memory,
+                    memory_percent=round(memory * 100 / total, 1),
                     temperature=temperature())

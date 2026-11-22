@@ -1,6 +1,5 @@
 import hashlib
 import logging
-import os
 import re
 from collections import deque
 import select
@@ -40,6 +39,7 @@ from connection.session import NetworkAccess, Session, SessionRegistry
 from connection.system import MODEL, ProcessMetrics
 from connection.tcp_bridge import VirtualHTTPBridge
 from connection import tun as devices
+from connection import workers as sharding
 from connection.utils import configure_networks, remove_networks
 from connection.virtual_http import VirtualHTTPServer
 
@@ -55,11 +55,30 @@ def exactly(text: str) -> dict:
     return {'$regex': '^' + re.escape(text) + '$', '$options': 'i'}
 
 
+# Reads that return at once when nothing waits; without it, one datagram per wake.
+DONTWAIT = getattr(socket, 'MSG_DONTWAIT', 0)
+
+
+def roomy(udp: socket.socket, size: int = 1 << 20):
+    # About 700 full datagrams: a burst waits here instead of being dropped by the system.
+    for option in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try: udp.setsockopt(socket.SOL_SOCKET, option, size)
+        except OSError: pass
+
+
 class VPNServer:
     def __init__(self, mongo_client: MongoClient, table_name: str,
                  secret: bytes or str = None, public: bool = False,
-                 internet: bool = False):
+                 internet: bool = False, worker: int = 0, workers: int = 1,
+                 mailboxes: sharding.Mailboxes = None):
         self.table_name = mongo_client[table_name]
+        # One process per core: each owns whole organizations; worker 0 also takes every login.
+        # A session opened by one worker moves to its organization's worker on connect.
+        self.worker, self.workers, self.mailboxes = worker, workers, mailboxes
+        # Identifiers that moved: here, where they went; there, the session they still name.
+        self.moved, self.aliases, self.organizations_loaded = {}, {}, set()
+        # The parent's process id when there are workers: metrics then cover all of them.
+        self.metrics_root = None
         # The server's own switch: without it no network can reach the internet.
         self.internet = internet
         # Public servers open registration; local ones accept added emails only.
@@ -321,11 +340,9 @@ class VPNServer:
         if primary and primary.network_id.__str__() == network_id.__str__(): self.disconnect(account_id)
 
     def load_forwards(self):
-        # At start: every organization's forwards and rules between members, as the panel left them.
+        # At start: this worker's organizations, with forwards, rules and panels as the panel left them.
         for organization_id in {network.get('organization_id') for network in self.table_name['networks'].find({})}:
-            if not organization_id: continue
-            self.forwarding.install(organization_id, self.access_admin.table(organization_id))
-            self.firewall.install(organization_id, self.security_admin.table(organization_id))
+            self.load_organization(organization_id)
 
     def create_organization(self, session: Session, name) -> dict:
         # Anyone with an account may found an organization and administer it.
@@ -341,11 +358,10 @@ class VPNServer:
 
     def found(self, account_id, name: str) -> tuple:
         # The organization starts with its administrator, a first network and that network's panel.
+        # Its own worker loads it; another one leaves it for the first connection there.
         organization_id = self.organizations.create(account_id, name)
         network = self.table_name['networks'].find_one(dict(organization_id=organization_id))
-        self.add_panel(network['_id'])
-        self.forwarding.install(organization_id, self.access_admin.table(organization_id))
-        self.firewall.install(organization_id, self.security_admin.table(organization_id))
+        self.load_organization(organization_id)
         return organization_id, network['_id']
 
     def refresh_member(self, organization_id, account_id):
@@ -358,18 +374,85 @@ class VPNServer:
 
     def open_session(self, account: dict, address: tuple, keys: dict) -> Session:
         # A login only opens the session; it gains routes on connect.
-        session_id = os.urandom(16)
+        session_id = sharding.session_id(self.worker, self.workers)
         cipher = PacketCipher(session_id, keys['server'], keys['client'])
         session = Session(account['_id'], address, cipher)
         session.username, session.email = account.get('username'), account.get('email')
         self.registry.add_session(session)
+        self.announce(session)
         return session
+
+    def announce(self, session: Session):
+        # One session per account across workers: the others drop the account's older one.
+        for worker in range(self.workers):
+            if worker == self.worker: continue
+            self.mailboxes.send(worker, dict(kind='drop', account_id=session.account_id,
+                                             session_id=session.cipher.session_id))
+
+    def owner(self, network_id) -> int:
+        if self.workers == 1: return self.worker
+        valid = type(network_id) is str and ObjectId.is_valid(network_id)
+        details = Network(self.table_name['networks'], network_id).get() if valid else None
+        return sharding.owner((details or {}).get('organization_id'), self.workers)
+
+    def migrate(self, session: Session, message: dict, worker: int) -> bool:
+        # The session continues in its organization's worker, which answers this request.
+        old = session.cipher.session_id
+        moved = self.mailboxes.send(worker, dict(
+            kind='adopt', old=old, account_id=session.account_id, username=session.username,
+            email=session.email, connection=session.connection, cipher=session.cipher.state(), message=message))
+        if not moved: return False
+        self.registry.remove_session(session.account_id)
+        self.moved[old] = worker, time.monotonic() + 60
+        return True
+
+    def adopt(self, message: dict):
+        # A new identifier that leads here; the client still knows the old one until this reply.
+        old = message['old']
+        cipher = PacketCipher.restored(sharding.session_id(self.worker, self.workers), message['cipher'])
+        session = Session(message['account_id'], message['connection'], cipher)
+        session.username, session.email = message['username'], message['email']
+        self.registry.add_session(session)
+        self.announce(session)
+        self.aliases[old] = session, time.monotonic() + 60
+        request = message['message']
+        session.request = request['request']
+        session.reply = self.control_reply(session, request)
+        session.reply['session'] = cipher.session_id.hex()
+        self.send_control(session, session.reply, old)
+
+    def receive_messages(self):
+        for message in self.mailboxes.receive(self.worker):
+            kind = message.get('kind')
+            if kind == 'adopt': self.adopt(message)
+            elif kind == 'control': self.receive_control((message['packet'], message['address']))
+            elif kind == 'drop':
+                session = self.registry.get_account(message['account_id'])
+                if session and session.cipher.session_id != message['session_id']:
+                    self.registry.remove_session(message['account_id'])
+
+    def load_organization(self, organization_id):
+        # The first time this worker serves an organization: its rules, forwards and panels.
+        if not organization_id or organization_id in self.organizations_loaded: return
+        if sharding.owner(organization_id, self.workers) != self.worker: return
+        self.organizations_loaded.add(organization_id)
+        self.forwarding.install(organization_id, self.access_admin.table(organization_id))
+        self.firewall.install(organization_id, self.security_admin.table(organization_id))
+        for network in self.table_name['networks'].find(dict(organization_id=organization_id)):
+            if network['_id'] in self.bridges: continue
+            try: self.add_panel(network['_id'])
+            except ValueError: logger.exception('The panel could not start')
 
     def activate(self, session: Session, account: dict, network_id) -> dict:
         # Read the configuration now, so a stale menu never assigns an address.
         valid = type(network_id) is str and ObjectId.is_valid(network_id)
         networks = self.network_accesses(account, network_id) if valid else None
         if not networks: return describe('network_unavailable')
+        # With several workers only the owner serves an organization, with its rules loaded.
+        if self.workers > 1:
+            organization_id = networks[0].organization_id
+            if sharding.owner(organization_id, self.workers) != self.worker: return describe('network_unavailable')
+            self.load_organization(organization_id)
         blocked = networks[0].organization_id and self.organizations.is_blocked(
             session.account_id, networks[0].organization_id)
         if blocked: return describe('account_blocked')
@@ -410,16 +493,21 @@ class VPNServer:
         else: reply.update(describe('unknown_action'))
         return reply
 
-    def send_control(self, session: Session, message: dict):
-        packet = session.cipher.encrypt(Control.pack(message), Protocol.control)
+    def send_control(self, session: Session, message: dict, session_id: bytes = None):
+        packet = session.cipher.encrypt(Control.pack(message), Protocol.control, session_id)
         self.server.sendto(packet, session.connection)
 
     def receive_control(self, connection: tuple[bytes, any]):
         packet, address = connection
         session_id = Protocol.unpack(packet, Protocol.control)[1]
-        session = self.registry.get_session(session_id)
-        if not session: return
-        try: message = Control.unpack(session.cipher.decrypt(packet, Protocol.control))
+        session, previous = self.registry.get_session(session_id), None
+        if not session:
+            # A request repeated under an identifier that moved: answered by its new worker.
+            alias, moved = self.aliases.get(session_id), self.moved.get(session_id)
+            if alias: session, previous = alias[0], session_id
+            elif moved: return self.mailboxes.send(moved[0], dict(kind='control', packet=packet, address=address))
+            else: return
+        try: message = Control.unpack(session.cipher.decrypt(packet, Protocol.control, previous))
         except (InvalidTag, ValueError): return
         session.packets += 1
         request = message.get('request')
@@ -427,9 +515,16 @@ class VPNServer:
         session.connection, session.last_packet = address, time.monotonic()
         # A retransmitted request receives the same reply without side effects.
         if request > session.request:
+            # Connecting to another worker's organization moves the session there.
+            if message.get('action') == Control.connect and not previous:
+                # If it cannot move now, nothing changes: the client's retry tries again.
+                worker = self.owner(message.get('network_id'))
+                if worker != self.worker:
+                    self.migrate(session, message, worker)
+                    return
             session.request = request
             session.reply = self.control_reply(session, message)
-        self.send_control(session, session.reply)
+        self.send_control(session, session.reply, previous)
 
     def connected_here(self, account_id, organization_id=None):
         # The live session of an account, when it is inside that organization (any, without one).
@@ -448,6 +543,8 @@ class VPNServer:
 
     def kick(self, account_id: ObjectId or str, organization_id=None):
         # The login ends here; the client is told not to reconnect by itself.
+        # Its panel logins end too, even while offline: a later VPN login must log in again.
+        self.web_sessions.end(ObjectId(account_id.__str__()), organization_id and ObjectId(organization_id.__str__()))
         session = self.connected_here(account_id, organization_id)
         if not session: return
         self.send_control(session, dict(action=Control.kicked))
@@ -470,6 +567,9 @@ class VPNServer:
             if current_time - state['created'] <= 15: continue
             self.handshakes.pop(key, None)
         self.attempts.cleanup()
+        for table in (self.moved, self.aliases):
+            for key, value in list(table.items()):
+                if value[1] < current_time: table.pop(key, None)
 
     def receive_hello(self, packet: bytes, address: tuple,
                       key: tuple, state: dict = None):
@@ -715,7 +815,7 @@ class VPNServer:
 
     def collect_metrics(self, interval: float = 5):
         # Slow probes run here; requests only read the latest snapshot.
-        metrics = ProcessMetrics()
+        metrics = ProcessMetrics(self.metrics_root)
         while True:
             time.sleep(interval)
             self.metrics = metrics.sample()
@@ -748,38 +848,67 @@ class VPNServer:
             online=online
         )
 
-    def run_server(self, port: int = 5732):
-        self.server.bind((self.ip_address, port))
+    # Datagrams read per wake: the loop's own upkeep is paid once for all of them,
+    # and the cap keeps one busy client from holding back timers and the internet.
+    BATCH = 64
+
+    def run_server(self, port: int = 5732, bound: socket.socket = None):
+        # bound: this worker's socket of the shared port, made by the parent process.
+        if bound:
+            self.server.close()
+            self.server = bound
+        else: self.server.bind((self.ip_address, port))
+        roomy(self.server)
         self.started = time.monotonic()
         Thread(target=self.save_transfer, daemon=True).start()
         Thread(target=self.collect_metrics, daemon=True).start()
         Thread(target=self.usage.write_forever, daemon=True).start()
         # Own cipher counters and packet order.
-        while True:
-            delays = [self.bridge_timeout(), self.traffic_delay(), self.egress.next_timeout()]
-            timeout = min(delay for delay in delays if delay is not None)
-            sources = [self.server, self.waker[0], *self.egress.readers()]
-            selected = select.select(sources, self.egress.writers(), self.egress.failures(), timeout)
-            readable = selected[0]
-            if self.waker[0] in readable: self.waker[0].recv(4096)
-            self.egress.ready(*selected)
-            self.egress.advance()
-            self.forwarding.advance()
-            self.firewall.advance()
-            self.usage.tick()
-            self.advance_bridges()
-            self.sample_traffic()
-            if self.server not in readable: continue
-            connection = self.server.recvfrom(65535)
-            self.cleanup_handshakes()
-            try: packet_type = Protocol.packet_type(connection[0])
-            except ValueError: continue
-            if packet_type in (Protocol.client_hello, Protocol.authentication):
-                self.receive_handshake(connection)
-            elif packet_type == Protocol.data:
-                self.send_packet(connection)
-            elif packet_type == Protocol.control:
-                self.receive_control(connection)
+        while True: self.serve_once()
+
+    def loop_timeout(self):
+        delays = [self.bridge_timeout(), self.traffic_delay(), self.egress.next_timeout()]
+        return min(delay for delay in delays if delay is not None)
+
+    def serve_once(self):
+        inbox = [self.mailboxes.inbox(self.worker)] if self.mailboxes else []
+        sources = [self.server, self.waker[0], *inbox, *self.egress.readers()]
+        selected = select.select(sources, self.egress.writers(), self.egress.failures(), self.loop_timeout())
+        readable = selected[0]
+        if self.waker[0] in readable: self.waker[0].recv(4096)
+        if inbox and inbox[0] in readable: self.receive_messages()
+        self.egress.ready(*selected)
+        if self.server in readable: self.receive_batch()
+        self.upkeep()
+
+    def receive_batch(self, limit: int = None) -> int:
+        # Every datagram already waiting, in arrival order, up to the cap.
+        received = 0
+        for received in range(1, (limit or self.BATCH) + 1):
+            # Only the first read is known to have data; the rest must not wait.
+            try: connection = self.server.recvfrom(65535, DONTWAIT if received > 1 else 0)
+            except (BlockingIOError, InterruptedError): return received - 1
+            except ConnectionError: continue
+            self.receive(connection)
+            if not DONTWAIT: break
+        return received
+
+    def receive(self, connection: tuple[bytes, any]):
+        try: packet_type = Protocol.packet_type(connection[0])
+        except ValueError: return
+        if packet_type == Protocol.data: self.send_packet(connection)
+        elif packet_type in (Protocol.client_hello, Protocol.authentication): self.receive_handshake(connection)
+        elif packet_type == Protocol.control: self.receive_control(connection)
+
+    def upkeep(self):
+        # Once per wake, after the batch: timers, the internet, panels and counters.
+        self.egress.advance()
+        self.forwarding.advance()
+        self.firewall.advance()
+        self.usage.tick()
+        self.advance_bridges()
+        self.sample_traffic()
+        self.cleanup_handshakes()
 
 
 class VPNClient:
@@ -800,6 +929,7 @@ class VPNClient:
         self.remembered, self.heard, self.recovering = None, 0, False
         self.connection = [self.server_address[0], '255.255.255.0']
         self.socket_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        roomy(self.socket_server)
         # Commands from other threads enter the tunnel loop through select().
         self.commands = socket.socketpair()
 
@@ -880,7 +1010,11 @@ class VPNClient:
                     except socket.timeout: break
                     if address != self.server_address: continue
                     reply = self.receive(response)
-                    if reply and reply.get('request') == self.request_id: return reply
+                    if not reply or reply.get('request') != self.request_id: continue
+                    # The server moved the session to another of its processes: a new identifier.
+                    moved = reply.pop('session', None)
+                    if type(moved) is str and len(moved) == 32: self.cipher.session_id = bytes.fromhex(moved)
+                    return reply
         finally: self.socket_server.settimeout(previous_timeout)
         raise VPNError('server_unreachable')
 
@@ -1001,15 +1135,19 @@ class VPNClient:
                 elif source is self.commands[1]:
                     if self.commanded(source.recv(4096)): return
                 else:
-                    packet, address = source.recvfrom(65535)
-                    if address == self.server_address and self.receive(packet) is not False:
-                        self.heard = time.monotonic()
+                    # Every datagram already waiting, so a burst from the server is not dropped.
+                    for count in range(self.BATCH):
+                        try: packet, address = source.recvfrom(65535, DONTWAIT if count else 0)
+                        except (BlockingIOError, InterruptedError): break
+                        if address == self.server_address and self.receive(packet) is not False:
+                            self.heard = time.monotonic()
+                        if not DONTWAIT or self.kicked or self.disconnected: break
                 if self.kicked: raise VPNError('session_ended')
                 if self.disconnected: self.reconnect()
             if time.monotonic() - self.heard > self.KEEPALIVE and not self.alive():
                 if self.recover(): return
 
-    KEEPALIVE, RETRY = 10, 3
+    KEEPALIVE, RETRY, BATCH = 10, 3, 64
 
     def alive(self) -> bool:
         # A quiet tunnel asks the server; a restarted one no longer knows this session.

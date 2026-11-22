@@ -3,13 +3,14 @@ import time
 
 
 class WebSession:
-    def __init__(self, account_id, session_id: bytes, now: float):
-        self.account_id, self.session_id = account_id, session_id
+    def __init__(self, account_id, organization_id, now: float):
+        self.account_id, self.organization_id = account_id, organization_id
         self.created = self.last_seen = now
 
 
 class WebSessions:
-    # Panel logins stay in memory and die with the VPN session behind them.
+    # Panel logins stay in memory and belong to an account inside one organization.
+    # A VPN reconnection of that account keeps them; a kick or a block ends them.
     def __init__(self, idle: float = 900, lifetime: float = 28800,
                  attempts: int = 3, delay: float = 60, maximum_delay: float = 3600):
         self.idle, self.lifetime = idle, lifetime
@@ -19,7 +20,7 @@ class WebSessions:
     def create(self, session, now: float = None) -> str:
         now = time.monotonic() if now is None else now
         token = secrets.token_urlsafe(32)
-        self.sessions[token] = WebSession(session.account_id, session.cipher.session_id, now)
+        self.sessions[token] = WebSession(session.account_id, session.organization_id, now)
         self.failures.pop(session.account_id, None)
         return token
 
@@ -30,8 +31,8 @@ class WebSessions:
         now = time.monotonic() if now is None else now
         web = self.sessions.get(token) if token and session else None
         if not web: return False
-        bound = web.session_id == session.cipher.session_id
-        bound = bound and web.account_id == session.account_id
+        # The tunnel still proves who is asking: the request needs a live session of this account here.
+        bound = web.account_id == session.account_id and web.organization_id == session.organization_id
         if not bound or self._expired(web, now):
             self.sessions.pop(token, None)
             return False
@@ -40,6 +41,12 @@ class WebSessions:
 
     def remove(self, token: str):
         self.sessions.pop(token, None)
+
+    def end(self, account_id, organization_id=None):
+        # Every panel login of an account, in one organization or in all of them.
+        for token, web in list(self.sessions.items()):
+            if web.account_id == account_id and organization_id in (None, web.organization_id):
+                self.sessions.pop(token, None)
 
     def blocked(self, account_id, now: float = None) -> float:
         now = time.monotonic() if now is None else now

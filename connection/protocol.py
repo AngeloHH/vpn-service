@@ -72,6 +72,7 @@ class PacketCipher:
     def __init__(self, session_id: bytes, send_key: bytes,
                  recv_key: bytes, client: bool = False):
         self.session_id, self.counter = session_id, 0
+        self.keys = send_key, recv_key, client
         # Separate ciphers and nonce domains prevent direction collisions.
         self.send_cipher = ChaCha20Poly1305(send_key)
         self.replay = ReplayWindow()
@@ -79,22 +80,36 @@ class PacketCipher:
         self.send_direction = bytes([0, 0, 0, 1 if client else 2])
         self.recv_direction = bytes([0, 0, 0, 2 if client else 1])
 
-    def encrypt(self, packet: bytes, packet_type: int = Protocol.data) -> bytes:
+    def state(self) -> dict:
+        # Everything another process needs to continue this session without reusing a nonce.
+        send_key, recv_key, client = self.keys
+        return dict(send_key=send_key, recv_key=recv_key, client=client, counter=self.counter,
+                    replay=(self.replay.counter, self.replay.window))
+
+    @classmethod
+    def restored(cls, session_id: bytes, state: dict) -> 'PacketCipher':
+        cipher = cls(session_id, state['send_key'], state['recv_key'], state['client'])
+        cipher.counter = state['counter']
+        cipher.replay.counter, cipher.replay.window = state['replay']
+        return cipher
+
+    def encrypt(self, packet: bytes, packet_type: int = Protocol.data, session_id: bytes = None) -> bytes:
         # A direction prefix and monotonic counter form the unique nonce.
         counter = self.counter.to_bytes(8, 'big')
         self.counter += 1
         nonce = self.send_direction + counter
         # The complete header is authenticated with the encrypted payload.
-        header = Protocol.pack(packet_type, self.session_id, counter)
+        header = Protocol.pack(packet_type, session_id or self.session_id, counter)
         encrypted = self.send_cipher.encrypt(nonce, packet, header)
         return header + encrypted
 
-    def decrypt(self, packet: bytes, packet_type: int = Protocol.data) -> bytes:
+    def decrypt(self, packet: bytes, packet_type: int = Protocol.data, session_id: bytes = None) -> bytes:
         # Read the public routing fields before authenticating the payload.
+        # session_id: a previous identifier, while a moved session's client still uses it.
         details = Protocol.unpack(packet, packet_type)
         identifier, encrypted, header = details[1:]
         error = 'Invalid encrypted packet'
-        invalid = identifier != self.session_id or len(encrypted) < 24
+        invalid = identifier != (session_id or self.session_id) or len(encrypted) < 24
         if invalid: raise ValueError(error)
         # Verify the packet before advancing the anti-replay window.
         counter, encrypted = encrypted[:8], encrypted[8:]

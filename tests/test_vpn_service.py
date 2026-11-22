@@ -1,5 +1,8 @@
 import re
+import socket
+import time
 import unittest
+from unittest import mock
 
 from bson import ObjectId
 from scapy.layers.inet import IP
@@ -72,6 +75,55 @@ class MongoClient:
 class Socket:
     def __init__(self): self.packets = []
     def sendto(self, packet, address): self.packets.append((packet, address))
+
+
+class LoopTest(unittest.TestCase):
+    # The packet loop reads every waiting datagram, then does its upkeep once.
+    def setUp(self):
+        self.server = VPNServer(MongoClient(Database({'accounts': Collection(), 'networks': Collection(),
+                                                      'connections': Collection()})), 'database')
+        self.server.server.bind(('127.0.0.1', 0))
+        self.address = self.server.server.getsockname()
+        self.sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def tearDown(self):
+        self.sender.close()
+        self.server.close()
+
+    def send(self, *payloads):
+        for payload in payloads: self.sender.sendto(payload, self.address)
+        time.sleep(0.05)
+
+    def test_a_wake_handles_every_waiting_datagram_then_its_upkeep_once(self):
+        self.send(b'one', b'two', b'three')
+        with mock.patch.object(self.server, 'receive') as receive, mock.patch.object(self.server, 'upkeep') as upkeep:
+            self.server.serve_once()
+        self.assertEqual([call.args[0][0] for call in receive.call_args_list], [b'one', b'two', b'three'])
+        upkeep.assert_called_once_with()
+
+    def test_the_batch_stops_at_its_cap(self):
+        self.send(*[bytes([n]) for n in range(5)])
+        with mock.patch.object(self.server, 'receive') as receive:
+            self.assertEqual(self.server.receive_batch(limit=3), 3)
+            self.assertEqual(receive.call_count, 3)
+            # Called only when select saw data: past the first read it never waits.
+            self.assertEqual(self.server.receive_batch(limit=10), 2)
+
+    def test_a_quiet_wake_still_does_its_upkeep(self):
+        with mock.patch.object(self.server, 'loop_timeout', return_value=0), \
+                mock.patch.object(self.server, 'upkeep') as upkeep, mock.patch.object(self.server, 'receive') as receive:
+            self.server.serve_once()
+        upkeep.assert_called_once_with()
+        receive.assert_not_called()
+
+    def test_datagrams_reach_their_handler_by_type(self):
+        with mock.patch.object(self.server, 'send_packet') as data, \
+                mock.patch.object(self.server, 'receive_handshake') as handshake, \
+                mock.patch.object(self.server, 'receive_control') as control:
+            for packet_type in (Protocol.data, Protocol.client_hello, Protocol.control):
+                self.server.receive((Protocol.pack(packet_type, bytes(16), bytes(24)), ('127.0.0.1', 1)))
+            self.server.receive((b'\xff', ('127.0.0.1', 1)))
+        self.assertEqual((data.call_count, handshake.call_count, control.call_count), (1, 1, 1))
 
 
 class VPNServiceTest(unittest.TestCase):
